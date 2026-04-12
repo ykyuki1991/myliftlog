@@ -1,0 +1,14 @@
+{
+  "name": "MyLiftLog",
+  "short_name": "LiftLog",
+  "description": "筋トレ記録アプリ - 前回の重量判断が早くなる個人用ログ",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#FFFFFF",
+  "theme_color": "#2563EB",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}

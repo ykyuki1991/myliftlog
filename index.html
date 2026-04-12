@@ -1,0 +1,3907 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#2563EB">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>MyLiftLog</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="apple-touch-icon" href="icon-192.png">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { overscroll-behavior: none; }
+    body { background: #FFFFFF; padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+    input[type=number]::-webkit-inner-spin-button,
+    input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+    input[type=number] { -moz-appearance: textfield; }
+    input, button, select { font-family: inherit; }
+  </style>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useCallback, useMemo, useEffect, useRef } = React;
+
+    // ============================================================
+    // MyLiftLog - ステップ4: 今日の記録 + 履歴 + 設定画面
+    // ============================================================
+
+    // --- ユーティリティ ---
+    const generateId = () =>
+      typeof crypto !== "undefined" && crypto.randomUUID
+        ? crypto.randomUUID()
+        : Math.random().toString(36).slice(2) + Date.now().toString(36);
+
+    const now = () => new Date().toISOString();
+    const todayStr = () => new Date().toISOString().slice(0, 10);
+
+    const formatDateJP = (dateStr) => {
+      const d = new Date(dateStr + "T00:00:00");
+      const dow = ["日", "月", "火", "水", "木", "金", "土"][d.getDay()];
+      return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}（${dow}）`;
+    };
+
+    // --- 部位選択肢 ---
+    const MUSCLE_GROUPS = ["胸", "背中", "肩", "脚", "腕"];
+
+    // --- 初期種目→部位マッピング ---
+    const DEFAULT_MUSCLE_MAP = {
+      "ベンチプレス": "胸", "インクラインダンベルプレス": "胸",
+      "ラットプルダウン": "背中", "バーベルロウ": "背中",
+      "サイドレイズ": "肩", "ショルダープレス": "肩",
+      "スクワット": "脚", "デッドリフト": "脚", "レッグプレス": "脚", "レッグカール": "脚",
+      "アームカール": "腕",
+    };
+
+    // --- 初期種目マスタ ---
+    const DEFAULT_EXERCISES = [
+      "ベンチプレス", "スクワット", "デッドリフト",
+      "インクラインダンベルプレス", "ラットプルダウン", "バーベルロウ",
+      "サイドレイズ", "レッグプレス", "レッグカール",
+    ].map((name, i) => ({
+      id: generateId(), name, sortOrder: i, isActive: true, createdAt: now(),
+      muscleGroup: DEFAULT_MUSCLE_MAP[name] || "胸",
+    }));
+
+    // --- 既存データのmuscleGroupマイグレーション ---
+    const migrateExercises = (exercises) =>
+      exercises.map((e) => e.muscleGroup ? e : { ...e, muscleGroup: DEFAULT_MUSCLE_MAP[e.name] || "胸" });
+
+    // --- Big3種目名（推定1RM表示対象） ---
+    const BIG3_NAMES = ["ベンチプレス", "スクワット", "デッドリフト"];
+
+    // --- 推定1RM計算（Epley式） ---
+    const calcE1RM = (weight, reps) => {
+      if (weight <= 0 || reps <= 0) return 0;
+      if (reps === 1) return weight;
+      return weight * (1 + reps / 30);
+    };
+
+    // ワークアウト内の特定種目の最大推定1RMを算出
+    const getWorkoutE1RM = (setsForExercise) => {
+      let max1RM = 0;
+      setsForExercise.forEach((s) => {
+        const e1rm = calcE1RM(s.weight, s.reps);
+        if (e1rm > max1RM) max1RM = e1rm;
+      });
+      return max1RM > 0 ? Math.round(max1RM * 10) / 10 : null;
+    };
+
+    // --- 今週の月曜〜日曜の範囲を算出 ---
+    const getWeekRange = () => {
+      const today = new Date();
+      const day = today.getDay(); // 0=日, 1=月, ...
+      const diff = day === 0 ? 6 : day - 1; // 月曜からの日数差
+      const mon = new Date(today);
+      mon.setDate(today.getDate() - diff);
+      const sun = new Date(mon);
+      sun.setDate(mon.getDate() + 6);
+      return {
+        start: mon.toISOString().slice(0, 10),
+        end: sun.toISOString().slice(0, 10),
+      };
+    };
+
+    // --- PR（自己ベスト）計算 ---
+    // 種目の全セットからPRを算出: { weight, reps, workoutId }
+    // 判定: 最大重量 → 同重量なら最大回数
+    const findPR = (allSets, exerciseId) => {
+      let pr = null;
+      allSets.forEach((s) => {
+        if (s.exerciseId !== exerciseId || s.weight <= 0 || s.reps <= 0) return;
+        if (!pr || s.weight > pr.weight || (s.weight === pr.weight && s.reps > pr.reps)) {
+          pr = { weight: s.weight, reps: s.reps, workoutId: s.workoutId, setId: s.id };
+        }
+      });
+      return pr;
+    };
+
+    // セットがPRかどうかを判定
+    const isPRSet = (set, allSets, exerciseId) => {
+      if (set.weight <= 0 || set.reps <= 0) return false;
+      const pr = findPR(allSets, exerciseId);
+      return pr && pr.weight === set.weight && pr.reps === set.reps && pr.setId === set.id;
+    };
+
+    // --- カラー定数（設計書 7-1） ---
+    const C = {
+      bg: "#FFFFFF",
+      text: "#1A1A1A",
+      sub: "#6B7280",
+      accent: "#2563EB",
+      danger: "#DC2626",
+      cardBg: "#F9FAFB",
+      border: "#E5E7EB",
+      prBadge: "#F59E0B",
+      warning: "#F59E0B",
+      warningBg: "#FEF3C7",
+      success: "#059669",
+    };
+
+    // --- 食事区分 ---
+    const MEAL_TYPES = [
+      { key: "breakfast", label: "朝食" },
+      { key: "lunch", label: "昼食" },
+      { key: "dinner", label: "夕食" },
+      { key: "preworkout", label: "トレ前" },
+      { key: "postworkout", label: "トレ後" },
+      { key: "snack", label: "その他間食" },
+    ];
+
+    // --- 活動量係数 ---
+    const ACTIVITY_MULTIPLIERS = { low: 1.2, slightlyLow: 1.375, normal: 1.55, high: 1.725 };
+    const ACTIVITY_LABELS = { low: "低い", slightlyLow: "やや低い", normal: "普通", high: "高い" };
+
+    // --- Mifflin-St Jeor BMR計算 ---
+    const calcBMR = (sex, weightKg, heightCm, age) => {
+      if (sex === "male") return 10 * weightKg + 6.25 * heightCm - 5 * age + 5;
+      return 10 * weightKg + 6.25 * heightCm - 5 * age - 161;
+    };
+
+    // --- 目標自動計算 ---
+    const calcNutritionGoals = (profile, bodyWeightKg) => {
+      const w = bodyWeightKg || 70;
+      const bmr = calcBMR(profile.sex, w, profile.heightCm, profile.age);
+      const mult = ACTIVITY_MULTIPLIERS[profile.activityLevel] || 1.55;
+      const maintenance = Math.round(bmr * mult);
+
+      let restKcal = maintenance;
+      if (profile.goalType === "cut") restKcal = maintenance - 300;
+      if (profile.goalType === "bulk") restKcal = maintenance + 300;
+      const trainingKcal = restKcal + 200;
+
+      const proteinG = Math.round(w * (profile.goalType === "bulk" ? 1.8 : 2.0));
+      const restFatG = Math.round((restKcal * 0.25) / 9);
+      const trainingFatG = Math.round((trainingKcal * 0.25) / 9);
+      const restCarbsG = Math.round((restKcal - proteinG * 4 - restFatG * 9) / 4);
+      const trainingCarbsG = Math.round((trainingKcal - proteinG * 4 - trainingFatG * 9) / 4);
+
+      return {
+        trainingDay: { kcal: trainingKcal, protein: proteinG, fat: trainingFatG, carbs: trainingCarbsG },
+        restDay: { kcal: restKcal, protein: proteinG, fat: restFatG, carbs: restCarbsG },
+        isManualOverride: false,
+      };
+    };
+
+    // ============================================================
+    // カスタムフック: useMyLiftLogDB（ステップ1から継承）
+    // ============================================================
+    function useMyLiftLogDB() {
+      const STORAGE_KEY = "myliftlog_data";
+
+      const DEFAULT_NUTRITION_SETTINGS = {
+        profile: { sex: "male", age: 30, heightCm: 170, activityLevel: "normal", trainingDaysPerWeek: 4, goalType: "maintain" },
+        goals: { trainingDay: { kcal: 2500, protein: 150, fat: 69, carbs: 250 }, restDay: { kcal: 2300, protein: 150, fat: 64, carbs: 219 }, isManualOverride: false },
+      };
+
+      const CURRENT_SCHEMA_VERSION = 2;
+
+      const loadData = () => {
+        try {
+          const stored = localStorage.getItem(STORAGE_KEY);
+          if (stored) {
+            const parsed = JSON.parse(stored);
+            // 後方互換: schemaVersion が無い場合は v1 として扱う
+            return {
+              schemaVersion: parsed.schemaVersion || 1,
+              exercises: migrateExercises(parsed.exercises || DEFAULT_EXERCISES),
+              workouts: parsed.workouts || [],
+              sets: parsed.sets || [],
+              templates: parsed.templates || [],
+              foods: parsed.foods || [],
+              mealTemplates: parsed.mealTemplates || [],
+              mealEntries: parsed.mealEntries || [],
+              nutritionSettings: parsed.nutritionSettings || DEFAULT_NUTRITION_SETTINGS,
+              trainingDayOverrides: parsed.trainingDayOverrides || {},
+            };
+          }
+        } catch (e) {
+          console.error("Failed to load from localStorage:", e);
+        }
+        return {
+          schemaVersion: CURRENT_SCHEMA_VERSION,
+          exercises: DEFAULT_EXERCISES,
+          workouts: [],
+          sets: [],
+          templates: [],
+          foods: [],
+          mealTemplates: [],
+          mealEntries: [],
+          nutritionSettings: DEFAULT_NUTRITION_SETTINGS,
+          trainingDayOverrides: {},
+        };
+      };
+
+      const saveData = (exercises, workouts, sets, templates, foods, mealTemplates, mealEntries, nutritionSettings, trainingDayOverrides) => {
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify({
+            schemaVersion: CURRENT_SCHEMA_VERSION,
+            exercises, workouts, sets, templates, foods, mealTemplates, mealEntries, nutritionSettings, trainingDayOverrides,
+          }));
+        } catch (e) {
+          console.error("Failed to save to localStorage:", e);
+        }
+      };
+
+      const initialData = loadData();
+      const [exercises, setExercises] = useState(initialData.exercises);
+      const [workouts, setWorkouts] = useState(initialData.workouts);
+      const [sets, setSets] = useState(initialData.sets);
+      const [templates, setTemplates] = useState(initialData.templates);
+      const [foods, setFoods] = useState(initialData.foods);
+      const [mealTemplates, setMealTemplates] = useState(initialData.mealTemplates);
+      const [mealEntries, setMealEntries] = useState(initialData.mealEntries);
+      const [nutritionSettings, setNutritionSettings] = useState(initialData.nutritionSettings);
+      const [trainingDayOverrides, setTrainingDayOverrides] = useState(initialData.trainingDayOverrides);
+
+      // Save to localStorage whenever data changes
+      useEffect(() => {
+        saveData(exercises, workouts, sets, templates, foods, mealTemplates, mealEntries, nutritionSettings, trainingDayOverrides);
+      }, [exercises, workouts, sets, templates, foods, mealTemplates, mealEntries, nutritionSettings, trainingDayOverrides]);
+
+      const addExercise = useCallback((name, muscleGroup) => {
+        let newEx = null;
+        setExercises((prev) => {
+          const maxSort = prev.reduce((m, e) => Math.max(m, e.sortOrder), -1);
+          newEx = { id: generateId(), name, sortOrder: maxSort + 1, isActive: true, createdAt: now(), muscleGroup: muscleGroup || "胸" };
+          return [...prev, newEx];
+        });
+        return newEx;
+      }, []);
+
+      const updateExercise = useCallback((id, updates) => {
+        setExercises((prev) => prev.map((e) => (e.id === id ? { ...e, ...updates } : e)));
+      }, []);
+
+      const deleteExercise = useCallback((id) => {
+        setExercises((prev) => prev.map((e) => (e.id === id ? { ...e, isActive: false } : e)));
+      }, []);
+
+      const activeExercises = useMemo(
+        () => exercises.filter((e) => e.isActive).sort((a, b) => a.sortOrder - b.sortOrder),
+        [exercises]
+      );
+
+      const getOrCreateWorkout = useCallback((date) => {
+        let result = null;
+        setWorkouts((prev) => {
+          const existing = prev.find((w) => w.date === date);
+          if (existing) { result = existing; return prev; }
+          result = { id: generateId(), date, bodyWeight: null, memo: "", createdAt: now(), updatedAt: now() };
+          return [...prev, result];
+        });
+        return result;
+      }, []);
+
+      const updateWorkout = useCallback((id, updates) => {
+        setWorkouts((prev) => prev.map((w) => (w.id === id ? { ...w, ...updates, updatedAt: now() } : w)));
+      }, []);
+
+      const deleteWorkout = useCallback((id) => {
+        setWorkouts((prev) => prev.filter((w) => w.id !== id));
+        setSets((prev) => prev.filter((s) => s.workoutId !== id));
+      }, []);
+
+      const getWorkoutByDate = useCallback(
+        (date) => workouts.find((w) => w.date === date) || null,
+        [workouts]
+      );
+
+      const addSet = useCallback((workoutId, exerciseId, weight, reps, memo) => {
+        let newSet = null;
+        setSets((prev) => {
+          const sameSets = prev.filter((r) => r.workoutId === workoutId && r.exerciseId === exerciseId);
+          const maxOrder = sameSets.reduce((m, r) => Math.max(m, r.setOrder), 0);
+          newSet = { id: generateId(), workoutId, exerciseId, setOrder: maxOrder + 1, weight, reps, memo: memo || "", createdAt: now() };
+          return [...prev, newSet];
+        });
+        return newSet;
+      }, []);
+
+      const updateSet = useCallback((id, updates) => {
+        setSets((prev) => prev.map((s) => (s.id === id ? { ...s, ...updates } : s)));
+      }, []);
+
+      const deleteSet = useCallback((id) => {
+        setSets((prev) => {
+          const target = prev.find((s) => s.id === id);
+          if (!target) return prev;
+          const remaining = prev.filter((s) => s.id !== id);
+          let order = 1;
+          return remaining.map((s) => {
+            if (s.workoutId === target.workoutId && s.exerciseId === target.exerciseId) {
+              return { ...s, setOrder: order++ };
+            }
+            return s;
+          });
+        });
+      }, []);
+
+      const getSetsForWorkoutExercise = useCallback(
+        (workoutId, exerciseId) =>
+          sets.filter((s) => s.workoutId === workoutId && s.exerciseId === exerciseId).sort((a, b) => a.setOrder - b.setOrder),
+        [sets]
+      );
+
+      const getPreviousRecord = useCallback(
+        (exerciseId, currentDate) => {
+          const matchingSets = sets.filter((s) => s.exerciseId === exerciseId);
+          if (matchingSets.length === 0) return null;
+          const workoutMap = {};
+          workouts.forEach((w) => { workoutMap[w.id] = w; });
+          const pastSets = matchingSets.filter((s) => {
+            const w = workoutMap[s.workoutId];
+            return w && w.date < currentDate;
+          });
+          if (pastSets.length === 0) return null;
+          let latestDate = "";
+          let latestWorkoutId = "";
+          pastSets.forEach((s) => {
+            const w = workoutMap[s.workoutId];
+            if (w && w.date > latestDate) { latestDate = w.date; latestWorkoutId = w.id; }
+          });
+          const resultSets = pastSets
+            .filter((s) => s.workoutId === latestWorkoutId)
+            .filter((s) => s.weight > 0 || s.reps > 0) // 空セット除外
+            .sort((a, b) => a.setOrder - b.setOrder)
+            .map((s) => ({ weight: s.weight, reps: s.reps }));
+          if (resultSets.length === 0) return null;
+          return { date: latestDate, sets: resultSets };
+        },
+        [sets, workouts]
+      );
+
+      const getExercisesInWorkout = useCallback(
+        (workoutId) => {
+          const workoutSets = sets.filter((s) => s.workoutId === workoutId);
+          const exerciseIds = [...new Set(workoutSets.map((s) => s.exerciseId))];
+          return exerciseIds.map((eid) => {
+            const ex = exercises.find((e) => e.id === eid);
+            return {
+              exerciseId: eid,
+              exerciseName: ex ? ex.name : "(削除済み)",
+              sets: workoutSets.filter((s) => s.exerciseId === eid).sort((a, b) => a.setOrder - b.setOrder),
+            };
+          });
+        },
+        [sets, exercises]
+      );
+
+      const removeExerciseFromWorkout = useCallback((workoutId, exerciseId) => {
+        setSets((prev) => prev.filter((s) => !(s.workoutId === workoutId && s.exerciseId === exerciseId)));
+      }, []);
+
+      // ---------- テンプレートCRUD ----------
+      const addTemplate = useCallback((name, exerciseIds) => {
+        let newTpl = null;
+        setTemplates((prev) => {
+          if (prev.length >= 10) return prev;
+          newTpl = { id: generateId(), name, exerciseIds };
+          return [...prev, newTpl];
+        });
+        return newTpl;
+      }, []);
+
+      const updateTemplate = useCallback((id, updates) => {
+        setTemplates((prev) => prev.map((t) => (t.id === id ? { ...t, ...updates } : t)));
+      }, []);
+
+      const deleteTemplate = useCallback((id) => {
+        setTemplates((prev) => prev.filter((t) => t.id !== id));
+      }, []);
+
+      // ---------- 全データ初期化 ----------
+      const resetAll = useCallback(() => {
+        setExercises(DEFAULT_EXERCISES.map((e) => ({ ...e, id: generateId(), createdAt: now() })));
+        setWorkouts([]);
+        setSets([]);
+        setTemplates([]);
+        setFoods([]);
+        setMealTemplates([]);
+        setMealEntries([]);
+        setNutritionSettings(DEFAULT_NUTRITION_SETTINGS);
+        setTrainingDayOverrides({});
+      }, []);
+
+      // ---------- CSVインポート ----------
+      const importData = useCallback((parsedRows, mode) => {
+        // mode: "overwrite" | "append"
+        // parsedRows: [{date, bodyWeight, workoutMemo, exerciseName, setNumber, weight, reps, exerciseMemo}, ...]
+
+        let currentExercises;
+        if (mode === "overwrite") {
+          // 上書きモード: 既存データを全削除し、デフォルト種目をベースにする
+          currentExercises = DEFAULT_EXERCISES.map((e) => ({ ...e, id: generateId(), createdAt: now() }));
+        } else {
+          // 追加モード: 既存種目をコピーして使う
+          currentExercises = [...exercises];
+        }
+
+        // CSV内の種目名を集めて、マスタに無ければ追加
+        const exerciseNames = [...new Set(parsedRows.filter((r) => r.exerciseName).map((r) => r.exerciseName))];
+        exerciseNames.forEach((name) => {
+          const exists = currentExercises.find((e) => e.name === name && e.isActive);
+          if (!exists) {
+            // 非アクティブだが存在する場合は再有効化
+            const inactive = currentExercises.find((e) => e.name === name && !e.isActive);
+            if (inactive) {
+              inactive.isActive = true;
+            } else {
+              // CSVに部位があればそれを使用、なければマッピングorデフォルト
+              const rowWithName = parsedRows.find((r) => r.exerciseName === name);
+              const mg = (rowWithName && rowWithName.muscleGroup && MUSCLE_GROUPS.includes(rowWithName.muscleGroup))
+                ? rowWithName.muscleGroup
+                : (DEFAULT_MUSCLE_MAP[name] || "胸");
+              const maxSort = currentExercises.reduce((m, e) => Math.max(m, e.sortOrder), -1);
+              currentExercises.push({
+                id: generateId(), name, sortOrder: maxSort + 1, isActive: true, createdAt: now(),
+                muscleGroup: mg,
+              });
+            }
+          }
+        });
+
+        let newWorkouts = mode === "overwrite" ? [] : [...workouts];
+        let newSets = mode === "overwrite" ? [] : [...sets];
+
+        // 日付ごとにグループ化
+        const dateGroups = {};
+        parsedRows.forEach((row) => {
+          if (!dateGroups[row.date]) dateGroups[row.date] = [];
+          dateGroups[row.date].push(row);
+        });
+
+        Object.keys(dateGroups).forEach((date) => {
+          // 追加モード: 同一日付のworkoutが既にあればスキップ
+          if (mode === "append") {
+            const existingWorkout = newWorkouts.find((w) => w.date === date);
+            if (existingWorkout) return; // スキップ
+          }
+
+          const rows = dateGroups[date];
+          const firstRow = rows[0];
+
+          // Workout作成
+          const workoutId = generateId();
+          const bodyWeight = firstRow.bodyWeight !== "" && !isNaN(parseFloat(firstRow.bodyWeight))
+            ? parseFloat(firstRow.bodyWeight)
+            : null;
+          newWorkouts.push({
+            id: workoutId,
+            date,
+            bodyWeight,
+            memo: firstRow.workoutMemo || "",
+            createdAt: now(),
+            updatedAt: now(),
+          });
+
+          // セットを追加（種目名がある行のみ）
+          rows.forEach((row) => {
+            if (!row.exerciseName) return;
+            const ex = currentExercises.find((e) => e.name === row.exerciseName && e.isActive);
+            if (!ex) return;
+            const weight = parseFloat(row.weight) || 0;
+            const reps = parseInt(row.reps, 10) || 0;
+            if (weight <= 0 && reps <= 0) return;
+            newSets.push({
+              id: generateId(),
+              workoutId,
+              exerciseId: ex.id,
+              setOrder: parseInt(row.setNumber, 10) || 1,
+              weight,
+              reps,
+              memo: row.exerciseMemo || "",
+              createdAt: now(),
+            });
+          });
+        });
+
+        setExercises(currentExercises);
+        setWorkouts(newWorkouts);
+        setSets(newSets);
+      }, [exercises, workouts, sets]);
+
+      // ---------- 食材マスタ CRUD ----------
+      const addFood = useCallback((name, baseAmount, baseUnit, kcal, protein, fat, carbs, isFavorite) => {
+        let newFood = null;
+        setFoods((prev) => {
+          newFood = { id: generateId(), name, baseAmount: baseAmount || 100, baseUnit: baseUnit || "g", kcal, protein, fat, carbs, isFavorite: isFavorite !== false, createdAt: now() };
+          return [...prev, newFood];
+        });
+        return newFood;
+      }, []);
+
+      const updateFood = useCallback((id, updates) => {
+        setFoods((prev) => prev.map((f) => (f.id === id ? { ...f, ...updates } : f)));
+      }, []);
+
+      const deleteFood = useCallback((id) => {
+        setFoods((prev) => prev.filter((f) => f.id !== id));
+      }, []);
+
+      // ---------- 食事記録 CRUD ----------
+      const addMealEntry = useCallback((date, mealType, foodId, templateId, nameSnapshot, amount, unit, kcal, protein, fat, carbs) => {
+        let newEntry = null;
+        setMealEntries((prev) => {
+          newEntry = {
+            id: generateId(), date, mealType,
+            sourceType: foodId ? "food" : "manual",
+            foodId: foodId || null, templateId: templateId || null,
+            nameSnapshot, amount, unit,
+            kcal: Math.round(kcal), protein: Math.round(protein * 10) / 10,
+            fat: Math.round(fat * 10) / 10, carbs: Math.round(carbs * 10) / 10,
+            createdAt: now(),
+          };
+          return [...prev, newEntry];
+        });
+        return newEntry;
+      }, []);
+
+      const deleteMealEntry = useCallback((id) => {
+        setMealEntries((prev) => prev.filter((e) => e.id !== id));
+      }, []);
+
+      // ---------- 食事テンプレ CRUD ----------
+      const addMealTemplate = useCallback((name, items) => {
+        let tpl = null;
+        setMealTemplates((prev) => {
+          tpl = { id: generateId(), name, items, createdAt: now() };
+          return [...prev, tpl];
+        });
+        return tpl;
+      }, []);
+
+      const updateMealTemplate = useCallback((id, updates) => {
+        setMealTemplates((prev) => prev.map((t) => (t.id === id ? { ...t, ...updates } : t)));
+      }, []);
+
+      const deleteMealTemplate = useCallback((id) => {
+        setMealTemplates((prev) => prev.filter((t) => t.id !== id));
+      }, []);
+
+      // ---------- 栄養設定 ----------
+      const updateNutritionSettings = useCallback((updates) => {
+        setNutritionSettings((prev) => ({ ...prev, ...updates }));
+      }, []);
+
+      const updateNutritionGoals = useCallback((goals) => {
+        setNutritionSettings((prev) => ({ ...prev, goals }));
+      }, []);
+
+      // ---------- トレ日/休養日 手動上書き ----------
+      const setTrainingDayOverride = useCallback((date, dayType) => {
+        // dayType: "training" | "rest" | null (nullで上書き解除)
+        setTrainingDayOverrides((prev) => {
+          if (dayType === null) {
+            const next = { ...prev };
+            delete next[date];
+            return next;
+          }
+          return { ...prev, [date]: dayType };
+        });
+      }, []);
+
+      // ---------- 全データJSON取得（バックアップ用） ----------
+      const exportAllData = useCallback(() => {
+        return JSON.stringify({
+          schemaVersion: CURRENT_SCHEMA_VERSION,
+          exercises, workouts, sets, templates, foods, mealTemplates, mealEntries, nutritionSettings, trainingDayOverrides,
+          exportedAt: now(),
+        }, null, 2);
+      }, [exercises, workouts, sets, templates, foods, mealTemplates, mealEntries, nutritionSettings, trainingDayOverrides]);
+
+      // ---------- 全データJSON復元（リストア用） ----------
+      const importAllData = useCallback((jsonStr) => {
+        try {
+          const data = JSON.parse(jsonStr);
+          if (!data.exercises || !Array.isArray(data.exercises)) throw new Error("Invalid backup: exercises missing");
+          setExercises(migrateExercises(data.exercises));
+          setWorkouts(data.workouts || []);
+          setSets(data.sets || []);
+          setTemplates(data.templates || []);
+          setFoods(data.foods || []);
+          setMealTemplates(data.mealTemplates || []);
+          setMealEntries(data.mealEntries || []);
+          setNutritionSettings(data.nutritionSettings || DEFAULT_NUTRITION_SETTINGS);
+          setTrainingDayOverrides(data.trainingDayOverrides || {});
+          return { success: true };
+        } catch (e) {
+          return { success: false, error: e.message };
+        }
+      }, []);
+
+      return {
+        exercises, activeExercises, workouts, sets, templates,
+        addExercise, updateExercise, deleteExercise,
+        getOrCreateWorkout, updateWorkout, deleteWorkout, getWorkoutByDate,
+        addSet, updateSet, deleteSet, getSetsForWorkoutExercise,
+        getPreviousRecord, getExercisesInWorkout, removeExerciseFromWorkout,
+        addTemplate, updateTemplate, deleteTemplate,
+        resetAll, importData,
+        // nutrition
+        foods, mealTemplates, mealEntries, nutritionSettings, trainingDayOverrides,
+        addFood, updateFood, deleteFood,
+        addMealEntry, deleteMealEntry,
+        addMealTemplate, updateMealTemplate, deleteMealTemplate,
+        updateNutritionSettings, updateNutritionGoals,
+        setTrainingDayOverride,
+        exportAllData, importAllData,
+      };
+    }
+
+    // ============================================================
+    // コンポーネント: バックアップバナー（BackupBanner）
+    // ============================================================
+    function BackupBanner() {
+      const [showBanner, setShowBanner] = useState(false);
+
+      useEffect(() => {
+        try {
+          const lastExport = localStorage.getItem("myliftlog_last_export");
+          if (!lastExport) {
+            setShowBanner(true);
+          } else {
+            const lastDate = new Date(lastExport);
+            const daysDiff = Math.floor((new Date() - lastDate) / (1000 * 60 * 60 * 24));
+            if (daysDiff >= 30) {
+              setShowBanner(true);
+            }
+          }
+        } catch (e) {
+          console.error("Failed to check backup date:", e);
+        }
+      }, []);
+
+      if (!showBanner) return null;
+
+      return (
+        <div style={{
+          padding: "12px 16px",
+          background: "#FEF3C7",
+          borderBottom: "1px solid #F59E0B",
+          fontSize: 13,
+          color: "#92400E",
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          justifyContent: "space-between",
+        }}>
+          <div>30日以上バックアップを取っていません。CSVエクスポートをお勧めします。</div>
+          <button
+            onClick={() => setShowBanner(false)}
+            style={{
+              background: "none",
+              border: "none",
+              color: "#92400E",
+              fontSize: 16,
+              cursor: "pointer",
+              padding: "0 4px",
+              flexShrink: 0,
+            }}
+          >
+            ×
+          </button>
+        </div>
+      );
+    }
+
+    // ============================================================
+    // コンポーネント: 前回記録表示（PreviousRecord）
+    // ============================================================
+    function PreviousRecord({ db, exerciseId, currentDate }) {
+      const prev = db.getPreviousRecord(exerciseId, currentDate);
+      if (!prev) {
+        return <div style={{ fontSize: 13, color: C.sub, marginBottom: 8 }}>前回: 記録なし</div>;
+      }
+      return (
+        <div style={{ fontSize: 13, color: C.sub, marginBottom: 8, lineHeight: 1.6 }}>
+          <div>前回: {formatDateJP(prev.date)}</div>
+          <div style={{ paddingLeft: 4 }}>
+            {prev.sets.map((s, i) => (
+              <span key={i}>{i > 0 && " / "}{s.weight}kg×{s.reps}</span>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // ============================================================
+    // コンポーネント: セット入力行（SetRow）
+    // ============================================================
+    function SetRow({ set, onUpdate, onDelete, isPR }) {
+      const [weight, setWeight] = useState(set.weight > 0 ? String(set.weight) : "");
+      const [reps, setReps] = useState(set.reps > 0 ? String(set.reps) : "");
+
+      const handleWeightBlur = () => {
+        const v = parseFloat(weight);
+        if (!isNaN(v) && v > 0 && v !== set.weight) {
+          onUpdate(set.id, { weight: v });
+        } else if (weight === "" || isNaN(v) || v <= 0) {
+          setWeight(set.weight > 0 ? String(set.weight) : "");
+        }
+      };
+
+      const handleRepsBlur = () => {
+        const v = parseInt(reps, 10);
+        if (!isNaN(v) && v > 0 && v !== set.reps) {
+          onUpdate(set.id, { reps: v });
+        } else if (reps === "" || isNaN(v) || v <= 0) {
+          setReps(set.reps > 0 ? String(set.reps) : "");
+        }
+      };
+
+      return (
+        <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+          <span style={{ fontSize: 13, color: C.sub, width: 36, flexShrink: 0, textAlign: "right" }}>
+            {set.setOrder}
+          </span>
+          <input
+            type="number"
+            inputMode="decimal"
+            step="0.5"
+            value={weight}
+            onChange={(e) => setWeight(e.target.value)}
+            onBlur={handleWeightBlur}
+            placeholder="kg"
+            style={{
+              width: 72, height: 44, padding: "0 8px",
+              border: `1px solid ${C.border}`, borderRadius: 6,
+              fontSize: 18, textAlign: "center", background: C.bg,
+            }}
+          />
+          <span style={{ fontSize: 13, color: C.sub }}>kg</span>
+          <input
+            type="number"
+            inputMode="numeric"
+            value={reps}
+            onChange={(e) => setReps(e.target.value)}
+            onBlur={handleRepsBlur}
+            placeholder="回"
+            style={{
+              width: 56, height: 44, padding: "0 8px",
+              border: `1px solid ${C.border}`, borderRadius: 6,
+              fontSize: 18, textAlign: "center", background: C.bg,
+            }}
+          />
+          <span style={{ fontSize: 13, color: C.sub }}>回</span>
+          {isPR && (
+            <span style={{
+              fontSize: 10, fontWeight: 800, color: "#fff", background: C.prBadge,
+              borderRadius: 4, padding: "2px 5px", flexShrink: 0, lineHeight: 1,
+            }}>PR!</span>
+          )}
+          <button
+            onClick={() => onDelete(set.id)}
+            style={{
+              width: 32, height: 32, display: "flex", alignItems: "center", justifyContent: "center",
+              background: "none", border: "none", color: C.danger,
+              fontSize: 18, cursor: "pointer", flexShrink: 0, marginLeft: "auto",
+            }}
+            aria-label="セット削除"
+          >
+            ×
+          </button>
+        </div>
+      );
+    }
+
+    // ============================================================
+    // コンポーネント: 種目ブロック（ExerciseBlock）
+    // ============================================================
+    function ExerciseBlock({ db, workoutId, exerciseId, exerciseName, currentDate, setsData, onRemove }) {
+      const [memo, setMemo] = useState(setsData.length > 0 ? setsData[0].memo || "" : "");
+
+      // setsData の memo が外部で変化した場合に同期
+      const externalMemo = setsData.length > 0 ? setsData[0].memo || "" : "";
+      const [prevExternalMemo, setPrevExternalMemo] = useState(externalMemo);
+      if (externalMemo !== prevExternalMemo) {
+        setPrevExternalMemo(externalMemo);
+        if (externalMemo && !memo) setMemo(externalMemo);
+      }
+
+      const handleAddSet = () => {
+        // blur をトリガーして SetRow の入力値を先に DB へ反映
+        if (document.activeElement instanceof HTMLElement) {
+          document.activeElement.blur();
+        }
+        // DB の最新値を読み取る（stale closure 回避）
+        const freshSets = db.getSetsForWorkoutExercise(workoutId, exerciseId);
+        const lastSet = freshSets.length > 0 ? freshSets[freshSets.length - 1] : null;
+        const w = lastSet && lastSet.weight > 0 ? lastSet.weight : 0;
+        const r = lastSet && lastSet.reps > 0 ? lastSet.reps : 0;
+        db.addSet(workoutId, exerciseId, w, r, memo);
+      };
+
+      const handleMemoBlur = () => {
+        // 同一 workout+exercise の全セットにメモを反映
+        setsData.forEach((s) => {
+          db.updateSet(s.id, { memo });
+        });
+      };
+
+      return (
+        <div style={{
+          background: C.cardBg, borderRadius: 10, padding: 14,
+          marginBottom: 12, border: `1px solid ${C.border}`,
+        }}>
+          {/* ヘッダー: 種目名 + 削除 */}
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+            <span style={{ fontSize: 16, fontWeight: 700, color: C.text }}>{exerciseName}</span>
+            <button
+              onClick={onRemove}
+              style={{
+                background: "none", border: "none", color: C.danger,
+                fontSize: 13, cursor: "pointer", padding: "4px 8px",
+              }}
+            >
+              ×削除
+            </button>
+          </div>
+
+          {/* 前回記録 */}
+          <PreviousRecord db={db} exerciseId={exerciseId} currentDate={currentDate} />
+
+          {/* PR（自己ベスト）表示 */}
+          {(() => {
+            const pr = findPR(db.sets, exerciseId);
+            if (!pr) return null;
+            const prWorkout = db.workouts.find((w) => w.id === pr.workoutId);
+            const prDateStr = prWorkout ? formatDateJP(prWorkout.date).replace(/（.+）$/, "") : "";
+            return (
+              <div style={{ fontSize: 12, color: C.prBadge, marginBottom: 6, fontWeight: 600 }}>
+                PR: {pr.weight}kg × {pr.reps}{prDateStr ? `（${prDateStr}）` : ""}
+              </div>
+            );
+          })()}
+
+          {/* 区切り線 */}
+          <div style={{ borderTop: `1px solid ${C.border}`, marginBottom: 8 }} />
+
+          {/* セット行 */}
+          {setsData.map((s) => (
+            <SetRow
+              key={s.id}
+              set={s}
+              onUpdate={(id, updates) => db.updateSet(id, updates)}
+              onDelete={(id) => db.deleteSet(id)}
+              isPR={isPRSet(s, db.sets, exerciseId)}
+            />
+          ))}
+
+          {/* セット追加ボタン */}
+          <button
+            onClick={handleAddSet}
+            style={{
+              width: "100%", padding: "10px 0", marginTop: 4,
+              background: "none", border: `1px dashed ${C.border}`, borderRadius: 6,
+              color: C.accent, fontSize: 14, fontWeight: 600, cursor: "pointer",
+            }}
+          >
+            + セット追加
+          </button>
+
+          {/* 推定1RM表示（Big3のみ） */}
+          {BIG3_NAMES.includes(exerciseName) && (() => {
+            const current1RM = getWorkoutE1RM(setsData);
+            if (!current1RM) return null;
+            // 前回の推定1RMを算出
+            const prev = db.getPreviousRecord(exerciseId, currentDate);
+            const prev1RM = prev ? getWorkoutE1RM(prev.sets.map((s) => ({ weight: s.weight, reps: s.reps }))) : null;
+            const diff = prev1RM ? Math.round((current1RM - prev1RM) * 10) / 10 : null;
+            return (
+              <div style={{
+                marginTop: 8, padding: "6px 10px",
+                background: "#F0F9FF", borderRadius: 6, fontSize: 13, lineHeight: 1.6,
+              }}>
+                <span style={{ fontWeight: 600, color: C.text }}>推定1RM: {current1RM.toFixed(1)}kg</span>
+                {prev1RM && diff !== null && (
+                  <span style={{ color: C.sub, marginLeft: 8 }}>
+                    （前回: {prev1RM.toFixed(1)}kg →{" "}
+                    <span style={{ color: diff > 0 ? "#059669" : diff < 0 ? C.danger : C.sub, fontWeight: 600 }}>
+                      {diff > 0 ? "+" : ""}{diff.toFixed(1)}kg
+                    </span>
+                    ）
+                  </span>
+                )}
+              </div>
+            );
+          })()}
+
+          {/* 種目メモ */}
+          <input
+            type="text"
+            value={memo}
+            onChange={(e) => setMemo(e.target.value)}
+            onBlur={handleMemoBlur}
+            placeholder="種目メモ（例: フォーム意識）"
+            style={{
+              width: "100%", marginTop: 8, padding: "8px 10px",
+              border: `1px solid ${C.border}`, borderRadius: 6,
+              fontSize: 14, color: C.text, background: C.bg, boxSizing: "border-box",
+            }}
+          />
+        </div>
+      );
+    }
+
+    // ============================================================
+    // コンポーネント: 種目選択ダイアログ（設計書 セクション8）
+    // ============================================================
+    function ExercisePickerModal({ db, alreadyAddedIds, onSelect, onClose }) {
+      const available = db.activeExercises.filter((e) => !alreadyAddedIds.includes(e.id));
+      const added = db.activeExercises.filter((e) => alreadyAddedIds.includes(e.id));
+
+      return (
+        <div style={{
+          position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)",
+          display: "flex", alignItems: "flex-end", justifyContent: "center", zIndex: 100,
+        }}
+          onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+        >
+          <div style={{
+            width: "100%", maxWidth: 480, maxHeight: "70vh",
+            background: C.bg, borderRadius: "16px 16px 0 0",
+            padding: "20px 16px", overflowY: "auto",
+          }}>
+            <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 16, color: C.text }}>種目を選択</div>
+
+            {available.length === 0 && (
+              <div style={{ fontSize: 14, color: C.sub, padding: "16px 0", textAlign: "center" }}>
+                すべての種目が追加済みです
+              </div>
+            )}
+
+            {available.map((ex) => (
+              <button
+                key={ex.id}
+                onClick={() => { onSelect(ex.id); onClose(); }}
+                style={{
+                  display: "block", width: "100%", textAlign: "left",
+                  padding: "14px 12px", marginBottom: 4,
+                  background: C.cardBg, border: `1px solid ${C.border}`, borderRadius: 8,
+                  fontSize: 15, color: C.text, cursor: "pointer",
+                }}
+              >
+                {ex.name}
+              </button>
+            ))}
+
+            {/* 追加済みはグレーアウト */}
+            {added.map((ex) => (
+              <div
+                key={ex.id}
+                style={{
+                  padding: "14px 12px", marginBottom: 4,
+                  background: "#F3F4F6", border: `1px solid ${C.border}`, borderRadius: 8,
+                  fontSize: 15, color: "#D1D5DB",
+                }}
+              >
+                {ex.name}（追加済み）
+              </div>
+            ))}
+
+            <button
+              onClick={onClose}
+              style={{
+                width: "100%", padding: "14px 0", marginTop: 12,
+                background: "none", border: `1px solid ${C.border}`, borderRadius: 8,
+                fontSize: 15, color: C.sub, cursor: "pointer", fontWeight: 600,
+              }}
+            >
+              キャンセル
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    // ============================================================
+    // コンポーネント: 日付セレクター（DateSelector）
+    // ============================================================
+    function DateSelector({ date, onChange }) {
+      return (
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+          <span style={{ fontSize: 18, fontWeight: 700, color: C.text }}>{formatDateJP(date)}</span>
+          <input
+            type="date"
+            value={date}
+            onChange={(e) => onChange(e.target.value)}
+            style={{
+              padding: "6px 10px", border: `1px solid ${C.border}`, borderRadius: 6,
+              fontSize: 13, color: C.accent, cursor: "pointer", background: C.bg,
+            }}
+          />
+        </div>
+      );
+    }
+
+    // ============================================================
+    // 画面: 今日の記録（RecordScreen）— 設計書 2-2
+    // ============================================================
+    function RecordScreen({ db }) {
+      const [currentDate, setCurrentDate] = useState(todayStr());
+      const [showPicker, setShowPicker] = useState(false);
+      const [showTemplatePicker, setShowTemplatePicker] = useState(false);
+      const [bodyWeightInput, setBodyWeightInput] = useState("");
+      const [memoInput, setMemoInput] = useState("");
+      const [initialized, setInitialized] = useState(false);
+
+      // Workout を自動作成（同一日付は1レコード）
+      const workout = db.getWorkoutByDate(currentDate);
+
+      // 日付変更時に Workout を自動作成 & フィールド同期
+      const ensureWorkout = () => {
+        const w = db.getOrCreateWorkout(currentDate);
+        return w;
+      };
+
+      // Workout の体重・メモをローカル state に同期
+      if (workout && !initialized) {
+        if (workout.bodyWeight !== null && bodyWeightInput === "") {
+          setBodyWeightInput(String(workout.bodyWeight));
+        }
+        if (workout.memo && memoInput === "") {
+          setMemoInput(workout.memo);
+        }
+        setInitialized(true);
+      }
+
+      const handleDateChange = (newDate) => {
+        setCurrentDate(newDate);
+        setInitialized(false);
+        const w = db.getWorkoutByDate(newDate);
+        if (w) {
+          setBodyWeightInput(w.bodyWeight !== null ? String(w.bodyWeight) : "");
+          setMemoInput(w.memo || "");
+        } else {
+          setBodyWeightInput("");
+          setMemoInput("");
+        }
+      };
+
+      const handleBodyWeightBlur = () => {
+        const w = ensureWorkout();
+        if (!w) return;
+        const v = parseFloat(bodyWeightInput);
+        if (!isNaN(v) && v > 0) {
+          db.updateWorkout(w.id, { bodyWeight: v });
+        } else if (bodyWeightInput === "") {
+          db.updateWorkout(w.id, { bodyWeight: null });
+        }
+      };
+
+      const handleMemoBlur = () => {
+        const w = ensureWorkout();
+        if (!w) return;
+        db.updateWorkout(w.id, { memo: memoInput });
+      };
+
+      const handleSelectExercise = (exerciseId) => {
+        const w = ensureWorkout();
+        if (!w) return;
+        // 最初のセット（空のセット行）を追加
+        db.addSet(w.id, exerciseId, 0, 0, "");
+      };
+
+      const exercisesInWorkout = workout ? db.getExercisesInWorkout(workout.id) : [];
+      const addedExerciseIds = exercisesInWorkout.map((e) => e.exerciseId);
+
+      return (
+        <div style={{ paddingBottom: 80 }}>
+          {/* 日付 */}
+          <DateSelector date={currentDate} onChange={handleDateChange} />
+
+          {/* 体重 */}
+          <div style={{
+            display: "flex", alignItems: "center", gap: 8,
+            marginBottom: 8, padding: "8px 12px",
+            background: C.cardBg, borderRadius: 8, border: `1px solid ${C.border}`,
+          }}>
+            <span style={{ fontSize: 14, color: C.sub, flexShrink: 0 }}>体重</span>
+            <input
+              type="number"
+              inputMode="decimal"
+              step="0.1"
+              value={bodyWeightInput}
+              onChange={(e) => setBodyWeightInput(e.target.value)}
+              onBlur={handleBodyWeightBlur}
+              placeholder="72.5"
+              style={{
+                width: 80, height: 40, padding: "0 8px",
+                border: `1px solid ${C.border}`, borderRadius: 6,
+                fontSize: 18, textAlign: "center", background: C.bg,
+              }}
+            />
+            <span style={{ fontSize: 14, color: C.sub }}>kg</span>
+          </div>
+
+          {/* 当日メモ */}
+          <div style={{
+            marginBottom: 16, padding: "8px 12px",
+            background: C.cardBg, borderRadius: 8, border: `1px solid ${C.border}`,
+          }}>
+            <input
+              type="text"
+              value={memoInput}
+              onChange={(e) => setMemoInput(e.target.value)}
+              onBlur={handleMemoBlur}
+              placeholder="当日メモ（例: 睡眠不足、調子良い）"
+              style={{
+                width: "100%", height: 40, padding: "0 8px",
+                border: "none", fontSize: 14, color: C.text,
+                background: "transparent", outline: "none", boxSizing: "border-box",
+              }}
+            />
+          </div>
+
+          {/* 種目ブロック一覧 */}
+          {exercisesInWorkout.map((exGroup) => (
+            <ExerciseBlock
+              key={exGroup.exerciseId}
+              db={db}
+              workoutId={workout.id}
+              exerciseId={exGroup.exerciseId}
+              exerciseName={exGroup.exerciseName}
+              currentDate={currentDate}
+              setsData={exGroup.sets}
+              onRemove={() => db.removeExerciseFromWorkout(workout.id, exGroup.exerciseId)}
+            />
+          ))}
+
+          {/* 種目追加ボタン + テンプレから追加ボタン */}
+          <div style={{ display: "flex", gap: 8 }}>
+            <button
+              onClick={() => setShowPicker(true)}
+              style={{
+                flex: 1, padding: "14px 0",
+                background: C.accent, color: "#FFFFFF", border: "none", borderRadius: 10,
+                fontSize: 15, fontWeight: 700, cursor: "pointer",
+              }}
+            >
+              + 種目を追加
+            </button>
+            {db.templates.length > 0 && (
+              <button
+                onClick={() => setShowTemplatePicker(true)}
+                style={{
+                  padding: "14px 12px",
+                  background: "none", color: C.accent,
+                  border: `1px solid ${C.accent}`, borderRadius: 10,
+                  fontSize: 13, fontWeight: 600, cursor: "pointer",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                テンプレ
+              </button>
+            )}
+          </div>
+
+          {/* 現在のメニューをテンプレに保存リンク */}
+          {exercisesInWorkout.length > 0 && (
+            <div style={{ textAlign: "center", marginTop: 10 }}>
+              <button
+                onClick={() => {
+                  const name = prompt("テンプレート名を入力してください（例: 胸の日）");
+                  if (!name || !name.trim()) return;
+                  if (db.templates.length >= 10) {
+                    alert("テンプレートは最大10個までです");
+                    return;
+                  }
+                  const exerciseIds = exercisesInWorkout.map((e) => e.exerciseId);
+                  db.addTemplate(name.trim(), exerciseIds);
+                  alert("テンプレートを保存しました");
+                }}
+                style={{
+                  background: "none", border: "none",
+                  color: C.sub, fontSize: 13, cursor: "pointer",
+                  textDecoration: "underline",
+                }}
+              >
+                現在のメニューをテンプレに保存
+              </button>
+            </div>
+          )}
+
+          {/* 種目選択モーダル */}
+          {showPicker && (
+            <ExercisePickerModal
+              db={db}
+              alreadyAddedIds={addedExerciseIds}
+              onSelect={handleSelectExercise}
+              onClose={() => setShowPicker(false)}
+            />
+          )}
+
+          {/* テンプレート選択モーダル */}
+          {showTemplatePicker && (
+            <TemplatePickerModal
+              db={db}
+              onApply={(tpl) => {
+                const w = ensureWorkout();
+                if (!w) return;
+                let addedCount = 0;
+                tpl.exerciseIds.forEach((exId) => {
+                  // 論理削除された種目はスキップ
+                  const ex = db.exercises.find((e) => e.id === exId);
+                  if (!ex || !ex.isActive) return;
+                  // 既に追加済みの種目はスキップ
+                  if (addedExerciseIds.includes(exId)) return;
+                  db.addSet(w.id, exId, 0, 0, "");
+                  addedCount++;
+                });
+              }}
+              onClose={() => setShowTemplatePicker(false)}
+            />
+          )}
+        </div>
+      );
+    }
+
+    // ============================================================
+    // コンポーネント: 日別アコーディオン（WorkoutAccordion）
+    // ============================================================
+    function WorkoutAccordion({ workout, exerciseGroups, isOpen, onToggle, allSets }) {
+      const hasData = exerciseGroups.length > 0;
+      return (
+        <div style={{
+          marginBottom: 8, borderRadius: 10,
+          border: `1px solid ${C.border}`, overflow: "hidden",
+        }}>
+          {/* ヘッダー行: 日付 + 体重 + 開閉矢印 */}
+          <button
+            onClick={onToggle}
+            style={{
+              width: "100%", display: "flex", alignItems: "center",
+              justifyContent: "space-between", padding: "12px 14px",
+              background: isOpen ? C.cardBg : C.bg,
+              border: "none", cursor: "pointer", textAlign: "left",
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <span style={{ fontSize: 13, color: C.sub, width: 16, flexShrink: 0 }}>
+                {isOpen ? "▼" : "▶"}
+              </span>
+              <span style={{ fontSize: 15, fontWeight: 600, color: C.text }}>
+                {formatDateJP(workout.date)}
+              </span>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              {workout.bodyWeight !== null && (
+                <span style={{ fontSize: 13, color: C.sub }}>
+                  {workout.bodyWeight}kg
+                </span>
+              )}
+              {hasData && (
+                <span style={{
+                  fontSize: 11, color: C.sub, background: "#F3F4F6",
+                  borderRadius: 10, padding: "2px 8px",
+                }}>
+                  {exerciseGroups.length}種目
+                </span>
+              )}
+            </div>
+          </button>
+
+          {/* 展開コンテンツ */}
+          {isOpen && (
+            <div style={{ padding: "0 14px 14px", background: C.cardBg }}>
+              {exerciseGroups.length === 0 ? (
+                <div style={{ fontSize: 13, color: C.sub, padding: "8px 0" }}>
+                  種目の記録がありません
+                </div>
+              ) : (
+                exerciseGroups.map((exGroup) => (
+                  <div key={exGroup.exerciseId} style={{ marginTop: 10 }}>
+                    <div style={{ fontSize: 14, fontWeight: 600, color: C.text, marginBottom: 4 }}>
+                      {exGroup.exerciseName}
+                    </div>
+                    {/* セット一覧: コンパクト横並び表示 */}
+                    <div style={{ fontSize: 13, color: C.sub, lineHeight: 1.6, paddingLeft: 4 }}>
+                      {exGroup.sets
+                        .filter((s) => s.weight > 0 || s.reps > 0)
+                        .map((s, i) => (
+                          <span key={s.id}>
+                            {i > 0 && " / "}
+                            {s.weight}kg×{s.reps}
+                            {allSets && isPRSet(s, allSets, exGroup.exerciseId) && (
+                              <span style={{
+                                fontSize: 9, fontWeight: 800, color: C.prBadge,
+                                marginLeft: 2, verticalAlign: "super",
+                              }}>PR</span>
+                            )}
+                          </span>
+                        ))}
+                    </div>
+                    {/* 種目メモ */}
+                    {exGroup.sets[0]?.memo && (
+                      <div style={{ fontSize: 12, color: C.accent, marginTop: 2, paddingLeft: 4 }}>
+                        {exGroup.sets[0].memo}
+                      </div>
+                    )}
+                    {/* 推定1RM（Big3のみ） */}
+                    {BIG3_NAMES.includes(exGroup.exerciseName) && (() => {
+                      const validSets = exGroup.sets.filter((s) => s.weight > 0 && s.reps > 0);
+                      const e1rm = getWorkoutE1RM(validSets);
+                      if (!e1rm) return null;
+                      return (
+                        <div style={{ fontSize: 12, color: "#2563EB", marginTop: 2, paddingLeft: 4, fontWeight: 600 }}>
+                          推定1RM: {e1rm.toFixed(1)}kg
+                        </div>
+                      );
+                    })()}
+                  </div>
+                ))
+              )}
+
+              {/* 当日メモ */}
+              {workout.memo && (
+                <div style={{
+                  marginTop: 12, padding: "8px 10px",
+                  background: "#EFF6FF", borderRadius: 6,
+                  fontSize: 13, color: "#1E40AF",
+                }}>
+                  {workout.memo}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ============================================================
+    // 画面: 履歴（HistoryScreen）— 設計書 2-3
+    // ============================================================
+    function HistoryScreen({ db }) {
+      const [openIds, setOpenIds] = useState({});
+      const [filterExerciseId, setFilterExerciseId] = useState("");
+
+      const toggleOpen = (id) =>
+        setOpenIds((prev) => ({ ...prev, [id]: !prev[id] }));
+
+      // 日付降順でソート
+      const sortedWorkouts = useMemo(
+        () => [...db.workouts].sort((a, b) => (b.date > a.date ? 1 : b.date < a.date ? -1 : 0)),
+        [db.workouts]
+      );
+
+      // 各 Workout の種目グループを取得（フィルタ適用）
+      const workoutsWithGroups = useMemo(() => {
+        return sortedWorkouts.map((w) => {
+          let groups = db.getExercisesInWorkout(w.id);
+          if (filterExerciseId) {
+            groups = groups.filter((g) => g.exerciseId === filterExerciseId);
+          }
+          return { workout: w, groups };
+        });
+      }, [sortedWorkouts, db, filterExerciseId]);
+
+      // フィルタ適用時: 該当する種目を含む Workout のみ表示
+      const visibleWorkouts = filterExerciseId
+        ? workoutsWithGroups.filter((wg) => wg.groups.length > 0)
+        : workoutsWithGroups;
+
+      // Big3サマリ: 各種目の直近5回分の推定1RM推移
+      const big3Summary = useMemo(() => {
+        return BIG3_NAMES.map((name) => {
+          const ex = db.exercises.find((e) => e.name === name && e.isActive);
+          if (!ex) return { name, data: [] };
+          // 日付降順で全ワークアウトを走査し、この種目のセットがあるものを集める
+          const data = [];
+          for (const w of sortedWorkouts) {
+            const wSets = db.sets
+              .filter((s) => s.workoutId === w.id && s.exerciseId === ex.id && (s.weight > 0 && s.reps > 0));
+            if (wSets.length === 0) continue;
+            const e1rm = getWorkoutE1RM(wSets);
+            if (e1rm) data.push({ date: w.date, e1rm });
+            if (data.length >= 5) break;
+          }
+          return { name, data: data.reverse() }; // 古い順に並べる
+        });
+      }, [sortedWorkouts, db.exercises, db.sets]);
+
+      const hasBig3Data = big3Summary.some((b) => b.data.length > 0);
+
+      return (
+        <div style={{ paddingBottom: 80 }}>
+          <div style={{ fontSize: 18, fontWeight: 700, color: C.text, marginBottom: 12 }}>
+            トレーニング履歴
+          </div>
+
+          {/* Big3サマリ */}
+          {hasBig3Data && (
+            <div style={{
+              marginBottom: 14, padding: "12px 14px",
+              background: C.cardBg, borderRadius: 10, border: `1px solid ${C.border}`,
+            }}>
+              <div style={{ fontSize: 14, fontWeight: 700, color: C.text, marginBottom: 8 }}>Big3 推定1RM推移</div>
+              {big3Summary.map((item) => {
+                if (item.data.length === 0) return null;
+                return (
+                  <div key={item.name} style={{ marginBottom: 6 }}>
+                    <span style={{ fontSize: 12, color: C.sub, display: "inline-block", width: 90 }}>{item.name}</span>
+                    <span style={{ fontSize: 13, color: C.text, fontWeight: 500 }}>
+                      {item.data.map((d, i) => (
+                        <span key={i}>
+                          {i > 0 && <span style={{ color: C.sub, margin: "0 3px" }}>→</span>}
+                          <span style={i === item.data.length - 1 ? { fontWeight: 700, color: C.accent } : {}}>
+                            {d.e1rm.toFixed(1)}
+                          </span>
+                        </span>
+                      ))}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {/* 週間ボリューム集計 */}
+          {(() => {
+            const week = getWeekRange();
+            const weekWorkouts = db.workouts.filter((w) => w.date >= week.start && w.date <= week.end);
+            const volumeByGroup = {};
+            MUSCLE_GROUPS.forEach((g) => { volumeByGroup[g] = 0; });
+            weekWorkouts.forEach((w) => {
+              const exGroups = db.getExercisesInWorkout(w.id);
+              exGroups.forEach((exGroup) => {
+                const ex = db.exercises.find((e) => e.id === exGroup.exerciseId);
+                if (!ex || !ex.muscleGroup) return;
+                const validSets = exGroup.sets.filter((s) => s.weight > 0 && s.reps > 0);
+                volumeByGroup[ex.muscleGroup] = (volumeByGroup[ex.muscleGroup] || 0) + validSets.length;
+              });
+            });
+            const maxSets = Math.max(...Object.values(volumeByGroup), 1);
+            return (
+              <div style={{
+                marginBottom: 14, padding: "12px 14px",
+                background: C.cardBg, borderRadius: 10, border: `1px solid ${C.border}`,
+              }}>
+                <div style={{ fontSize: 14, fontWeight: 700, color: C.text, marginBottom: 8 }}>
+                  今週のボリューム
+                  <span style={{ fontSize: 11, fontWeight: 400, color: C.sub, marginLeft: 8 }}>
+                    {week.start.slice(5).replace("-", "/")}〜{week.end.slice(5).replace("-", "/")}
+                  </span>
+                </div>
+                {MUSCLE_GROUPS.map((g) => (
+                  <div key={g} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                    <span style={{ fontSize: 12, color: C.sub, width: 32, flexShrink: 0 }}>{g}</span>
+                    <div style={{ flex: 1, height: 16, background: "#F3F4F6", borderRadius: 4, overflow: "hidden" }}>
+                      <div style={{
+                        width: `${Math.max((volumeByGroup[g] / maxSets) * 100, 0)}%`,
+                        height: "100%", background: volumeByGroup[g] > 0 ? C.accent : "transparent",
+                        borderRadius: 4, transition: "width 0.3s",
+                      }} />
+                    </div>
+                    <span style={{ fontSize: 12, color: C.text, fontWeight: 600, width: 48, textAlign: "right", flexShrink: 0 }}>
+                      {volumeByGroup[g]}セット
+                    </span>
+                  </div>
+                ))}
+              </div>
+            );
+          })()}
+
+          {/* 種目フィルター */}
+          <div style={{
+            marginBottom: 14, padding: "8px 12px",
+            background: C.cardBg, borderRadius: 8, border: `1px solid ${C.border}`,
+            display: "flex", alignItems: "center", gap: 8,
+          }}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
+              stroke={C.sub} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
+            </svg>
+            <select
+              value={filterExerciseId}
+              onChange={(e) => setFilterExerciseId(e.target.value)}
+              style={{
+                flex: 1, padding: "6px 4px", border: "none", background: "transparent",
+                fontSize: 14, color: C.text, cursor: "pointer", outline: "none",
+              }}
+            >
+              <option value="">すべての種目</option>
+              {db.activeExercises.map((ex) => (
+                <option key={ex.id} value={ex.id}>{ex.name}</option>
+              ))}
+            </select>
+            {filterExerciseId && (
+              <button
+                onClick={() => setFilterExerciseId("")}
+                style={{
+                  background: "none", border: "none", color: C.danger,
+                  fontSize: 16, cursor: "pointer", padding: "0 4px",
+                }}
+              >
+                ×
+              </button>
+            )}
+          </div>
+
+          {/* 履歴一覧 */}
+          {visibleWorkouts.length === 0 ? (
+            <div style={{
+              textAlign: "center", padding: "40px 0", color: C.sub, fontSize: 14,
+            }}>
+              {db.workouts.length === 0
+                ? "まだトレーニング記録がありません"
+                : "該当する記録がありません"}
+            </div>
+          ) : (
+            visibleWorkouts.map(({ workout, groups }) => (
+              <WorkoutAccordion
+                key={workout.id}
+                workout={workout}
+                exerciseGroups={groups}
+                isOpen={!!openIds[workout.id]}
+                onToggle={() => toggleOpen(workout.id)}
+                allSets={db.sets}
+              />
+            ))
+          )}
+
+          {/* 件数表示 */}
+          {db.workouts.length > 0 && (
+            <div style={{
+              textAlign: "center", padding: "12px 0", fontSize: 12, color: C.sub,
+            }}>
+              {filterExerciseId
+                ? `${visibleWorkouts.length}件 / 全${db.workouts.length}件`
+                : `全${db.workouts.length}件`}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ============================================================
+    // コンポーネント: 種目管理（ExerciseManager）— 設計書 2-4
+    // ============================================================
+    function ExerciseManager({ db }) {
+      const [newName, setNewName] = useState("");
+      const [newMuscleGroup, setNewMuscleGroup] = useState("胸");
+      const [editingId, setEditingId] = useState(null);
+      const [editingName, setEditingName] = useState("");
+      const [editingMuscleGroup, setEditingMuscleGroup] = useState("胸");
+      const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+
+      const handleAdd = () => {
+        const trimmed = newName.trim();
+        if (!trimmed) return;
+        // 重複チェック
+        if (db.activeExercises.some((e) => e.name === trimmed)) return;
+        db.addExercise(trimmed, newMuscleGroup);
+        setNewName("");
+        setNewMuscleGroup("胸");
+      };
+
+      const startEdit = (ex) => {
+        setEditingId(ex.id);
+        setEditingName(ex.name);
+        setEditingMuscleGroup(ex.muscleGroup || "胸");
+      };
+
+      const saveEdit = () => {
+        const trimmed = editingName.trim();
+        if (!trimmed || !editingId) { setEditingId(null); return; }
+        // 重複チェック（自分自身は除外）
+        if (db.activeExercises.some((e) => e.id !== editingId && e.name === trimmed)) {
+          setEditingId(null);
+          return;
+        }
+        db.updateExercise(editingId, { name: trimmed, muscleGroup: editingMuscleGroup });
+        setEditingId(null);
+      };
+
+      const handleDelete = (ex) => {
+        // 過去記録があるか確認
+        const hasRecords = db.sets.some((s) => s.exerciseId === ex.id);
+        if (hasRecords) {
+          setConfirmDeleteId(ex.id);
+        } else {
+          db.deleteExercise(ex.id);
+        }
+      };
+
+      const confirmDelete = () => {
+        if (confirmDeleteId) {
+          db.deleteExercise(confirmDeleteId);
+          setConfirmDeleteId(null);
+        }
+      };
+
+      const deleteTarget = confirmDeleteId
+        ? db.exercises.find((e) => e.id === confirmDeleteId)
+        : null;
+
+      return (
+        <div style={{ marginBottom: 24 }}>
+          <div style={{ fontSize: 16, fontWeight: 700, color: C.text, marginBottom: 12 }}>種目管理</div>
+
+          {/* 種目一覧 */}
+          <div style={{ marginBottom: 12 }}>
+            {db.activeExercises.map((ex) => (
+              <div
+                key={ex.id}
+                style={{
+                  display: "flex", alignItems: "center", gap: 8,
+                  padding: "10px 12px", marginBottom: 4,
+                  background: C.cardBg, borderRadius: 8, border: `1px solid ${C.border}`,
+                }}
+              >
+                {editingId === ex.id ? (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6, width: "100%" }}>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <input
+                        type="text"
+                        value={editingName}
+                        onChange={(e) => setEditingName(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === "Enter") saveEdit(); }}
+                        autoFocus
+                        style={{
+                          flex: 1, padding: "6px 8px",
+                          border: `1px solid ${C.accent}`, borderRadius: 6,
+                          fontSize: 14, color: C.text,
+                        }}
+                      />
+                      <select
+                        value={editingMuscleGroup}
+                        onChange={(e) => setEditingMuscleGroup(e.target.value)}
+                        style={{
+                          padding: "6px 8px", border: `1px solid ${C.accent}`, borderRadius: 6,
+                          fontSize: 12, color: C.text, background: C.bg,
+                        }}
+                      >
+                        {MUSCLE_GROUPS.map((g) => <option key={g} value={g}>{g}</option>)}
+                      </select>
+                    </div>
+                    <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
+                      <button
+                        onClick={() => setEditingId(null)}
+                        style={{
+                          padding: "6px 8px", background: "none",
+                          border: `1px solid ${C.border}`, borderRadius: 6,
+                          fontSize: 12, color: C.sub, cursor: "pointer",
+                        }}
+                      >
+                        取消
+                      </button>
+                      <button
+                        onClick={saveEdit}
+                        style={{
+                          padding: "6px 12px", background: C.accent, color: "#fff",
+                          border: "none", borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: "pointer",
+                        }}
+                      >
+                        保存
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <span style={{ flex: 1, fontSize: 14, color: C.text }}>
+                      {ex.name}
+                      <span style={{ fontSize: 11, color: C.sub, marginLeft: 6 }}>({ex.muscleGroup || "未設定"})</span>
+                    </span>
+                    <button
+                      onClick={() => startEdit(ex)}
+                      style={{
+                        padding: "4px 10px", background: "none",
+                        border: `1px solid ${C.border}`, borderRadius: 6,
+                        fontSize: 12, color: C.sub, cursor: "pointer",
+                      }}
+                    >
+                      編集
+                    </button>
+                    <button
+                      onClick={() => handleDelete(ex)}
+                      style={{
+                        padding: "4px 10px", background: "none",
+                        border: `1px solid ${C.border}`, borderRadius: 6,
+                        fontSize: 12, color: C.danger, cursor: "pointer",
+                      }}
+                    >
+                      ×
+                    </button>
+                  </>
+                )}
+              </div>
+            ))}
+          </div>
+
+          {/* 種目追加 */}
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <input
+              type="text"
+              value={newName}
+              onChange={(e) => setNewName(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") handleAdd(); }}
+              placeholder="新しい種目名"
+              style={{
+                flex: 1, minWidth: 120, padding: "10px 12px",
+                border: `1px solid ${C.border}`, borderRadius: 8,
+                fontSize: 14, color: C.text,
+              }}
+            />
+            <select
+              value={newMuscleGroup}
+              onChange={(e) => setNewMuscleGroup(e.target.value)}
+              style={{
+                padding: "10px 8px", border: `1px solid ${C.border}`, borderRadius: 8,
+                fontSize: 14, color: C.text, background: C.bg,
+              }}
+            >
+              {MUSCLE_GROUPS.map((g) => <option key={g} value={g}>{g}</option>)}
+            </select>
+            <button
+              onClick={handleAdd}
+              style={{
+                padding: "10px 18px", background: C.accent, color: "#fff",
+                border: "none", borderRadius: 8, fontSize: 14, fontWeight: 600, cursor: "pointer",
+              }}
+            >
+              + 追加
+            </button>
+          </div>
+
+          {/* 削除確認ダイアログ（過去記録あり） */}
+          {confirmDeleteId && deleteTarget && (
+            <div style={{
+              position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)",
+              display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100,
+            }}>
+              <div style={{
+                background: C.bg, borderRadius: 12, padding: 24, width: "90%", maxWidth: 340,
+              }}>
+                <div style={{ fontSize: 15, fontWeight: 700, color: C.text, marginBottom: 12 }}>
+                  種目を削除しますか？
+                </div>
+                <div style={{ fontSize: 13, color: C.sub, marginBottom: 20, lineHeight: 1.6 }}>
+                  「{deleteTarget.name}」には過去のトレーニング記録があります。
+                  種目マスタから非表示になりますが、過去の記録は保持されます。
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button
+                    onClick={() => setConfirmDeleteId(null)}
+                    style={{
+                      flex: 1, padding: "12px 0",
+                      background: "none", border: `1px solid ${C.border}`, borderRadius: 8,
+                      fontSize: 14, color: C.sub, cursor: "pointer",
+                    }}
+                  >
+                    キャンセル
+                  </button>
+                  <button
+                    onClick={confirmDelete}
+                    style={{
+                      flex: 1, padding: "12px 0",
+                      background: C.danger, color: "#fff", border: "none", borderRadius: 8,
+                      fontSize: 14, fontWeight: 600, cursor: "pointer",
+                    }}
+                  >
+                    削除する
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ============================================================
+    // コンポーネント: CSVエクスポート（CsvExportButton）— 設計書セクション5
+    // ============================================================
+    function CsvExportButton({ db }) {
+      const [exported, setExported] = useState(false);
+
+      const handleExport = () => {
+        // データなしチェック（エラーハンドリング: 設計書セクション9）
+        if (db.workouts.length === 0) {
+          alert("エクスポートするデータがありません");
+          return;
+        }
+
+        // ヘッダー行
+        const header = "日付,体重(kg),当日メモ,種目名,部位,セット番号,重量(kg),回数,種目メモ";
+
+        // 日付の降順で出力
+        const sortedWorkouts = [...db.workouts].sort((a, b) =>
+          b.date > a.date ? 1 : b.date < a.date ? -1 : 0
+        );
+
+        const rows = [];
+        sortedWorkouts.forEach((w) => {
+          const exGroups = db.getExercisesInWorkout(w.id);
+          if (exGroups.length === 0) {
+            // 種目なし（体重・メモのみの日）
+            rows.push(csvRow([w.date, w.bodyWeight, w.memo, "", "", "", "", "", ""]));
+          } else {
+            // 同一日内は種目の追加順、セット順で出力
+            exGroups.forEach((exGroup) => {
+              const validSets = exGroup.sets.filter((s) => s.weight > 0 || s.reps > 0);
+              if (validSets.length === 0) return;
+              const ex = db.exercises.find((e) => e.id === exGroup.exerciseId);
+              const muscleGroup = ex ? (ex.muscleGroup || "") : "";
+              validSets.forEach((s) => {
+                rows.push(csvRow([
+                  w.date,
+                  w.bodyWeight !== null ? w.bodyWeight : "",
+                  w.memo || "",
+                  exGroup.exerciseName,
+                  muscleGroup,
+                  s.setOrder,
+                  s.weight,
+                  s.reps,
+                  s.memo || "",
+                ]));
+              });
+            });
+          }
+        });
+
+        const csvContent = header + "\n" + rows.join("\n");
+
+        // UTF-8 BOM付き（設計書: Excelでの文字化け防止）
+        const bom = "\uFEFF";
+        const blob = new Blob([bom + csvContent], { type: "text/csv;charset=utf-8;" });
+
+        // ファイル名: myliftlog_YYYYMMDD.csv
+        const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+        const fileName = `myliftlog_${dateStr}.csv`;
+
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = fileName;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+
+        localStorage.setItem("myliftlog_last_export", new Date().toISOString());
+
+        setExported(true);
+        setTimeout(() => setExported(false), 3000);
+      };
+
+      return (
+        <button
+          onClick={handleExport}
+          style={{
+            width: "100%", padding: "14px 0",
+            background: exported ? "#059669" : C.accent, color: "#fff",
+            border: "none", borderRadius: 8,
+            fontSize: 14, fontWeight: 600, cursor: "pointer",
+            transition: "background 0.2s",
+          }}
+        >
+          {exported ? "エクスポート完了" : "CSVエクスポート"}
+        </button>
+      );
+    }
+
+    // CSVフィールドのエスケープ
+    function csvRow(fields) {
+      return fields
+        .map((f) => {
+          const s = String(f ?? "");
+          if (s.includes(",") || s.includes('"') || s.includes("\n")) {
+            return '"' + s.replace(/"/g, '""') + '"';
+          }
+          return s;
+        })
+        .join(",");
+    }
+
+    // ============================================================
+    // コンポーネント: CSVインポート（CsvImportButton）
+    // ============================================================
+    function CsvImportButton({ db }) {
+      const [step, setStep] = useState("idle");
+      // steps: idle → modeSelect → fileSelect → confirm → done
+      const [mode, setMode] = useState(null); // "overwrite" | "append"
+      const [parsedRows, setParsedRows] = useState([]);
+      const [summary, setSummary] = useState(null); // { days, sets, skipped }
+      const [error, setError] = useState(null);
+
+      const HEADER_NEW = "日付,体重(kg),当日メモ,種目名,部位,セット番号,重量(kg),回数,種目メモ";
+      const HEADER_OLD = "日付,体重(kg),当日メモ,種目名,セット番号,重量(kg),回数,種目メモ";
+
+      const resetState = () => {
+        setStep("idle");
+        setMode(null);
+        setParsedRows([]);
+        setSummary(null);
+        setError(null);
+      };
+
+      const handleModeSelect = (selectedMode) => {
+        setMode(selectedMode);
+        if (selectedMode === "overwrite") {
+          // 上書きモードは追加警告を出してからファイル選択へ
+          setStep("overwriteWarn");
+        } else {
+          setStep("fileSelect");
+        }
+      };
+
+      const handleOverwriteConfirm = () => {
+        setStep("fileSelect");
+      };
+
+      const parseCSV = (text) => {
+        // BOM除去
+        const content = text.replace(/^\uFEFF/, "");
+        const lines = content.split(/\r?\n/).filter((l) => l.trim());
+        if (lines.length < 2) {
+          setError("データが含まれていません");
+          return;
+        }
+
+        // ヘッダー検証（新旧両対応）
+        const header = lines[0].trim();
+        let hasMuscleGroup = false;
+        if (header === HEADER_NEW) {
+          hasMuscleGroup = true;
+        } else if (header !== HEADER_OLD) {
+          setError("このファイルはインポートできません（カラム構成が一致しません）");
+          return;
+        }
+
+        // CSVパース（ダブルクォート対応）
+        const parseCSVLine = (line) => {
+          const fields = [];
+          let current = "";
+          let inQuotes = false;
+          for (let i = 0; i < line.length; i++) {
+            const ch = line[i];
+            if (inQuotes) {
+              if (ch === '"' && line[i + 1] === '"') {
+                current += '"';
+                i++;
+              } else if (ch === '"') {
+                inQuotes = false;
+              } else {
+                current += ch;
+              }
+            } else {
+              if (ch === '"') {
+                inQuotes = true;
+              } else if (ch === ",") {
+                fields.push(current);
+                current = "";
+              } else {
+                current += ch;
+              }
+            }
+          }
+          fields.push(current);
+          return fields;
+        };
+
+        const minCols = hasMuscleGroup ? 9 : 8;
+        const rows = [];
+        for (let i = 1; i < lines.length; i++) {
+          const fields = parseCSVLine(lines[i]);
+          if (fields.length < minCols) continue;
+          // 日付の基本検証
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(fields[0])) continue;
+          if (hasMuscleGroup) {
+            rows.push({
+              date: fields[0], bodyWeight: fields[1], workoutMemo: fields[2],
+              exerciseName: fields[3], muscleGroup: fields[4],
+              setNumber: fields[5], weight: fields[6], reps: fields[7], exerciseMemo: fields[8],
+            });
+          } else {
+            rows.push({
+              date: fields[0], bodyWeight: fields[1], workoutMemo: fields[2],
+              exerciseName: fields[3], muscleGroup: "",
+              setNumber: fields[4], weight: fields[5], reps: fields[6], exerciseMemo: fields[7],
+            });
+          }
+        }
+
+        if (rows.length === 0) {
+          setError("インポート可能なデータがありません");
+          return;
+        }
+
+        // 集計
+        const dates = [...new Set(rows.map((r) => r.date))];
+        const setsCount = rows.filter((r) => r.exerciseName).length;
+
+        // 追加モードの場合、スキップされる日数を計算
+        let skippedDays = 0;
+        if (mode === "append") {
+          dates.forEach((date) => {
+            if (db.workouts.some((w) => w.date === date)) {
+              skippedDays++;
+            }
+          });
+        }
+
+        setParsedRows(rows);
+        setSummary({
+          days: dates.length,
+          sets: setsCount,
+          skipped: skippedDays,
+          importDays: dates.length - skippedDays,
+        });
+        setStep("confirm");
+      };
+
+      const handleFileChange = (e) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+          parseCSV(ev.target.result);
+        };
+        reader.readAsText(file, "UTF-8");
+      };
+
+      const handleExecute = () => {
+        db.importData(parsedRows, mode);
+        setStep("done");
+      };
+
+      // ファイル入力の ref
+      const fileInputRef = useRef(null);
+
+      // fileSelect ステップに入ったらファイル選択を開く
+      useEffect(() => {
+        if (step === "fileSelect" && fileInputRef.current) {
+          fileInputRef.current.click();
+        }
+      }, [step]);
+
+      return (
+        <>
+          {/* 非表示のファイル入力 */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".csv"
+            style={{ display: "none" }}
+            onChange={handleFileChange}
+            onClick={(e) => { e.target.value = ""; }}
+          />
+
+          <button
+            onClick={() => setStep("modeSelect")}
+            style={{
+              width: "100%", padding: "14px 0",
+              background: "none", color: C.accent,
+              border: `1px solid ${C.accent}`, borderRadius: 8,
+              fontSize: 14, fontWeight: 600, cursor: "pointer",
+            }}
+          >
+            CSVインポート
+          </button>
+
+          {/* エラーダイアログ */}
+          {error && (
+            <div style={{
+              position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)",
+              display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100,
+            }}>
+              <div style={{
+                background: C.bg, borderRadius: 12, padding: 24, width: "90%", maxWidth: 340,
+              }}>
+                <div style={{ fontSize: 15, fontWeight: 700, color: C.danger, marginBottom: 12 }}>
+                  インポートエラー
+                </div>
+                <div style={{ fontSize: 14, color: C.text, marginBottom: 20, lineHeight: 1.6 }}>
+                  {error}
+                </div>
+                <button
+                  onClick={resetState}
+                  style={{
+                    width: "100%", padding: "12px 0",
+                    background: C.accent, color: "#fff", border: "none", borderRadius: 8,
+                    fontSize: 14, fontWeight: 600, cursor: "pointer",
+                  }}
+                >
+                  OK
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* モード選択ダイアログ */}
+          {step === "modeSelect" && (
+            <div style={{
+              position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)",
+              display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100,
+            }}>
+              <div style={{
+                background: C.bg, borderRadius: 12, padding: 24, width: "90%", maxWidth: 340,
+              }}>
+                <div style={{ fontSize: 15, fontWeight: 700, color: C.text, marginBottom: 16 }}>
+                  インポートモードを選択
+                </div>
+                <button
+                  onClick={() => handleModeSelect("overwrite")}
+                  style={{
+                    width: "100%", padding: "14px 12px", marginBottom: 8,
+                    background: C.cardBg, border: `1px solid ${C.border}`, borderRadius: 8,
+                    fontSize: 14, color: C.text, cursor: "pointer", textAlign: "left",
+                  }}
+                >
+                  <div style={{ fontWeight: 600 }}>上書きモード</div>
+                  <div style={{ fontSize: 12, color: C.sub, marginTop: 4 }}>
+                    既存データを全削除してからインポート
+                  </div>
+                </button>
+                <button
+                  onClick={() => handleModeSelect("append")}
+                  style={{
+                    width: "100%", padding: "14px 12px", marginBottom: 12,
+                    background: C.cardBg, border: `1px solid ${C.border}`, borderRadius: 8,
+                    fontSize: 14, color: C.text, cursor: "pointer", textAlign: "left",
+                  }}
+                >
+                  <div style={{ fontWeight: 600 }}>追加モード</div>
+                  <div style={{ fontSize: 12, color: C.sub, marginTop: 4 }}>
+                    既存データを残したまま追記（同一日付はスキップ）
+                  </div>
+                </button>
+                <button
+                  onClick={resetState}
+                  style={{
+                    width: "100%", padding: "12px 0",
+                    background: "none", border: `1px solid ${C.border}`, borderRadius: 8,
+                    fontSize: 14, color: C.sub, cursor: "pointer",
+                  }}
+                >
+                  キャンセル
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* 上書きモード警告 */}
+          {step === "overwriteWarn" && (
+            <div style={{
+              position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)",
+              display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100,
+            }}>
+              <div style={{
+                background: C.bg, borderRadius: 12, padding: 24, width: "90%", maxWidth: 340,
+              }}>
+                <div style={{ fontSize: 15, fontWeight: 700, color: C.danger, marginBottom: 12 }}>
+                  注意: 上書きモード
+                </div>
+                <div style={{ fontSize: 14, color: C.text, marginBottom: 20, lineHeight: 1.6 }}>
+                  既存データがすべて削除されます。インポートしたデータのみが残ります。続けますか？
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button
+                    onClick={resetState}
+                    style={{
+                      flex: 1, padding: "12px 0",
+                      background: "none", border: `1px solid ${C.border}`, borderRadius: 8,
+                      fontSize: 14, color: C.sub, cursor: "pointer",
+                    }}
+                  >
+                    キャンセル
+                  </button>
+                  <button
+                    onClick={handleOverwriteConfirm}
+                    style={{
+                      flex: 1, padding: "12px 0",
+                      background: C.danger, color: "#fff", border: "none", borderRadius: 8,
+                      fontSize: 14, fontWeight: 600, cursor: "pointer",
+                    }}
+                  >
+                    続ける
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* 確認ダイアログ */}
+          {step === "confirm" && summary && (
+            <div style={{
+              position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)",
+              display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100,
+            }}>
+              <div style={{
+                background: C.bg, borderRadius: 12, padding: 24, width: "90%", maxWidth: 340,
+              }}>
+                <div style={{ fontSize: 15, fontWeight: 700, color: C.text, marginBottom: 12 }}>
+                  インポート内容の確認
+                </div>
+                <div style={{ fontSize: 14, color: C.text, marginBottom: 16, lineHeight: 1.8 }}>
+                  {mode === "append" && summary.skipped > 0 ? (
+                    <>
+                      <div>{summary.days}日分のデータを検出</div>
+                      <div style={{ color: C.sub }}>うち{summary.skipped}日分は既存データと重複のためスキップ</div>
+                      <div style={{ fontWeight: 600 }}>{summary.importDays}日分のトレーニング、{summary.sets}セットをインポートします</div>
+                    </>
+                  ) : (
+                    <div style={{ fontWeight: 600 }}>{summary.days}日分のトレーニング、{summary.sets}セットをインポートします</div>
+                  )}
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button
+                    onClick={resetState}
+                    style={{
+                      flex: 1, padding: "12px 0",
+                      background: "none", border: `1px solid ${C.border}`, borderRadius: 8,
+                      fontSize: 14, color: C.sub, cursor: "pointer",
+                    }}
+                  >
+                    キャンセル
+                  </button>
+                  <button
+                    onClick={handleExecute}
+                    style={{
+                      flex: 1, padding: "12px 0",
+                      background: C.accent, color: "#fff", border: "none", borderRadius: 8,
+                      fontSize: 14, fontWeight: 600, cursor: "pointer",
+                    }}
+                  >
+                    インポート実行
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* 完了ダイアログ */}
+          {step === "done" && (
+            <div style={{
+              position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)",
+              display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100,
+            }}>
+              <div style={{
+                background: C.bg, borderRadius: 12, padding: 24, width: "90%", maxWidth: 340, textAlign: "center",
+              }}>
+                <div style={{ fontSize: 32, marginBottom: 8 }}>&#10003;</div>
+                <div style={{ fontSize: 15, fontWeight: 700, color: C.text, marginBottom: 16 }}>
+                  インポートが完了しました
+                </div>
+                <button
+                  onClick={resetState}
+                  style={{
+                    width: "100%", padding: "12px 0",
+                    background: C.accent, color: "#fff", border: "none", borderRadius: 8,
+                    fontSize: 14, fontWeight: 600, cursor: "pointer",
+                  }}
+                >
+                  OK
+                </button>
+              </div>
+            </div>
+          )}
+        </>
+      );
+    }
+
+    // ============================================================
+    // コンポーネント: JSONバックアップ（JsonBackupButton）
+    // ============================================================
+    function JsonBackupButton({ db }) {
+      const handleExport = () => {
+        const json = db.exportAllData();
+        const blob = new Blob([json], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        const dateStr = todayStr().replace(/-/g, "");
+        a.href = url;
+        a.download = `myliftlog_backup_${dateStr}.json`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      };
+
+      return (
+        <button onClick={handleExport}
+          style={{
+            width: "100%", padding: "14px 0",
+            background: C.accent, color: "#fff",
+            border: "none", borderRadius: 8,
+            fontSize: 14, fontWeight: 600, cursor: "pointer",
+          }}
+        >全データバックアップ（JSON）</button>
+      );
+    }
+
+    // ============================================================
+    // コンポーネント: JSONリストア（JsonRestoreButton）
+    // ============================================================
+    function JsonRestoreButton({ db }) {
+      const [step, setStep] = useState("idle"); // idle | confirm | done | error
+      const [errorMsg, setErrorMsg] = useState("");
+      const fileRef = useRef(null);
+
+      const handleFileSelect = (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        setStep("confirm");
+        // ファイルを一時保持
+        fileRef.current = file;
+      };
+
+      const handleRestore = () => {
+        const file = fileRef.current;
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          const result = db.importAllData(e.target.result);
+          if (result.success) {
+            setStep("done");
+          } else {
+            setErrorMsg(result.error);
+            setStep("error");
+          }
+        };
+        reader.readAsText(file);
+      };
+
+      const resetState = () => {
+        setStep("idle");
+        setErrorMsg("");
+        fileRef.current = null;
+      };
+
+      return (
+        <>
+          <label style={{
+            display: "block", width: "100%", padding: "14px 0",
+            background: "none", color: C.accent,
+            border: `1px solid ${C.accent}`, borderRadius: 8,
+            fontSize: 14, fontWeight: 600, cursor: "pointer", textAlign: "center", boxSizing: "border-box",
+          }}>
+            全データ復元（JSON）
+            <input type="file" accept=".json" onChange={handleFileSelect}
+              style={{ display: "none" }}
+            />
+          </label>
+
+          {step === "confirm" && (
+            <div style={{
+              position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)",
+              display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100,
+            }}>
+              <div style={{ background: C.bg, borderRadius: 12, padding: 24, width: "90%", maxWidth: 340 }}>
+                <div style={{ fontSize: 15, fontWeight: 700, color: C.text, marginBottom: 12 }}>データを復元しますか？</div>
+                <div style={{ fontSize: 13, color: C.sub, marginBottom: 20, lineHeight: 1.6 }}>
+                  現在のすべてのデータが上書きされます。復元前にバックアップを取ることをお勧めします。
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button onClick={resetState}
+                    style={{ flex: 1, padding: "12px 0", background: "none", border: `1px solid ${C.border}`, borderRadius: 8, fontSize: 14, color: C.sub, cursor: "pointer" }}
+                  >キャンセル</button>
+                  <button onClick={handleRestore}
+                    style={{ flex: 1, padding: "12px 0", background: C.accent, color: "#fff", border: "none", borderRadius: 8, fontSize: 14, fontWeight: 600, cursor: "pointer" }}
+                  >復元する</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {step === "done" && (
+            <div style={{
+              position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)",
+              display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100,
+            }}>
+              <div style={{ background: C.bg, borderRadius: 12, padding: 24, width: "90%", maxWidth: 340, textAlign: "center" }}>
+                <div style={{ fontSize: 32, marginBottom: 8 }}>&#10003;</div>
+                <div style={{ fontSize: 15, fontWeight: 700, color: C.text, marginBottom: 16 }}>復元が完了しました</div>
+                <button onClick={resetState}
+                  style={{ width: "100%", padding: "12px 0", background: C.accent, color: "#fff", border: "none", borderRadius: 8, fontSize: 14, fontWeight: 600, cursor: "pointer" }}
+                >OK</button>
+              </div>
+            </div>
+          )}
+
+          {step === "error" && (
+            <div style={{
+              position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)",
+              display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100,
+            }}>
+              <div style={{ background: C.bg, borderRadius: 12, padding: 24, width: "90%", maxWidth: 340, textAlign: "center" }}>
+                <div style={{ fontSize: 15, fontWeight: 700, color: C.danger, marginBottom: 12 }}>復元に失敗しました</div>
+                <div style={{ fontSize: 13, color: C.sub, marginBottom: 16, lineHeight: 1.6 }}>{errorMsg}</div>
+                <button onClick={resetState}
+                  style={{ width: "100%", padding: "12px 0", background: C.accent, color: "#fff", border: "none", borderRadius: 8, fontSize: 14, fontWeight: 600, cursor: "pointer" }}
+                >OK</button>
+              </div>
+            </div>
+          )}
+        </>
+      );
+    }
+
+    // ============================================================
+    // コンポーネント: 全データ削除（DataResetButton）— 設計書セクション9
+    // ============================================================
+    function DataResetButton({ db }) {
+      const [step, setStep] = useState(0); // 0=idle, 1=first confirm, 2=second confirm
+
+      const handleReset = () => {
+        db.resetAll();
+        setStep(0);
+      };
+
+      return (
+        <>
+          <button
+            onClick={() => setStep(1)}
+            style={{
+              width: "100%", padding: "14px 0",
+              background: "none", color: C.danger,
+              border: `1px solid ${C.danger}`, borderRadius: 8,
+              fontSize: 14, fontWeight: 600, cursor: "pointer",
+            }}
+          >
+            全データ削除
+          </button>
+
+          {/* 確認ダイアログ 1回目 */}
+          {step >= 1 && (
+            <div style={{
+              position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)",
+              display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100,
+            }}>
+              <div style={{
+                background: C.bg, borderRadius: 12, padding: 24, width: "90%", maxWidth: 340,
+              }}>
+                {step === 1 ? (
+                  <>
+                    <div style={{ fontSize: 15, fontWeight: 700, color: C.danger, marginBottom: 12 }}>
+                      本当に削除しますか？
+                    </div>
+                    <div style={{ fontSize: 13, color: C.sub, marginBottom: 20, lineHeight: 1.6 }}>
+                      すべてのトレーニング記録・体重記録・食事記録・食材マスタ・栄養設定が削除されます。
+                      種目マスタは初期状態に戻ります。
+                    </div>
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <button
+                        onClick={() => setStep(0)}
+                        style={{
+                          flex: 1, padding: "12px 0",
+                          background: "none", border: `1px solid ${C.border}`, borderRadius: 8,
+                          fontSize: 14, color: C.sub, cursor: "pointer",
+                        }}
+                      >
+                        キャンセル
+                      </button>
+                      <button
+                        onClick={() => setStep(2)}
+                        style={{
+                          flex: 1, padding: "12px 0",
+                          background: C.danger, color: "#fff", border: "none", borderRadius: 8,
+                          fontSize: 14, fontWeight: 600, cursor: "pointer",
+                        }}
+                      >
+                        削除する
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div style={{ fontSize: 15, fontWeight: 700, color: C.danger, marginBottom: 12 }}>
+                      全データが消えます。よろしいですか？
+                    </div>
+                    <div style={{ fontSize: 13, color: C.sub, marginBottom: 20, lineHeight: 1.6 }}>
+                      この操作は元に戻せません。
+                      事前にJSONバックアップで退避することをお勧めします。
+                    </div>
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <button
+                        onClick={() => setStep(0)}
+                        style={{
+                          flex: 1, padding: "12px 0",
+                          background: "none", border: `1px solid ${C.border}`, borderRadius: 8,
+                          fontSize: 14, color: C.sub, cursor: "pointer",
+                        }}
+                      >
+                        やめる
+                      </button>
+                      <button
+                        onClick={handleReset}
+                        style={{
+                          flex: 1, padding: "12px 0",
+                          background: C.danger, color: "#fff", border: "none", borderRadius: 8,
+                          fontSize: 14, fontWeight: 700, cursor: "pointer",
+                        }}
+                      >
+                        完全に削除
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
+          )}
+        </>
+      );
+    }
+
+    // ============================================================
+    // コンポーネント: テンプレート管理（TemplateManager）
+    // ============================================================
+    function TemplateManager({ db }) {
+      const [showForm, setShowForm] = useState(false);
+      const [editingId, setEditingId] = useState(null);
+      const [tplName, setTplName] = useState("");
+      const [selectedIds, setSelectedIds] = useState([]);
+      const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+
+      const toggleExercise = (id) => {
+        setSelectedIds((prev) =>
+          prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+        );
+      };
+
+      const startNew = () => {
+        if (db.templates.length >= 10) {
+          alert("テンプレートは最大10個までです");
+          return;
+        }
+        setEditingId(null);
+        setTplName("");
+        setSelectedIds([]);
+        setShowForm(true);
+      };
+
+      const startEdit = (tpl) => {
+        setEditingId(tpl.id);
+        setTplName(tpl.name);
+        setSelectedIds([...tpl.exerciseIds]);
+        setShowForm(true);
+      };
+
+      const handleSave = () => {
+        const trimmed = tplName.trim();
+        if (!trimmed || selectedIds.length === 0) return;
+        if (editingId) {
+          db.updateTemplate(editingId, { name: trimmed, exerciseIds: selectedIds });
+        } else {
+          db.addTemplate(trimmed, selectedIds);
+        }
+        setShowForm(false);
+        setEditingId(null);
+        setTplName("");
+        setSelectedIds([]);
+      };
+
+      const handleDelete = () => {
+        if (confirmDeleteId) {
+          db.deleteTemplate(confirmDeleteId);
+          setConfirmDeleteId(null);
+        }
+      };
+
+      const getExerciseNames = (exerciseIds) => {
+        return exerciseIds
+          .map((id) => {
+            const ex = db.exercises.find((e) => e.id === id);
+            return ex ? (ex.isActive ? ex.name : null) : null;
+          })
+          .filter(Boolean)
+          .join("、");
+      };
+
+      return (
+        <div style={{ marginBottom: 24 }}>
+          <div style={{ fontSize: 16, fontWeight: 700, color: C.text, marginBottom: 12 }}>テンプレート管理</div>
+
+          {db.templates.length === 0 && (
+            <div style={{ fontSize: 13, color: C.sub, marginBottom: 12 }}>
+              テンプレートを登録すると、よく使う種目の組み合わせをワンタップで追加できます。
+            </div>
+          )}
+
+          {/* テンプレート一覧 */}
+          {db.templates.map((tpl) => (
+            <div
+              key={tpl.id}
+              style={{
+                padding: "10px 12px", marginBottom: 4,
+                background: C.cardBg, borderRadius: 8, border: `1px solid ${C.border}`,
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 14, fontWeight: 600, color: C.text }}>{tpl.name}</div>
+                  <div style={{ fontSize: 12, color: C.sub, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {getExerciseNames(tpl.exerciseIds) || "(種目なし)"}
+                  </div>
+                </div>
+                <div style={{ display: "flex", gap: 6, flexShrink: 0, marginLeft: 8 }}>
+                  <button
+                    onClick={() => startEdit(tpl)}
+                    style={{
+                      padding: "4px 10px", background: "none",
+                      border: `1px solid ${C.border}`, borderRadius: 6,
+                      fontSize: 12, color: C.sub, cursor: "pointer",
+                    }}
+                  >
+                    編集
+                  </button>
+                  <button
+                    onClick={() => setConfirmDeleteId(tpl.id)}
+                    style={{
+                      padding: "4px 10px", background: "none",
+                      border: `1px solid ${C.border}`, borderRadius: 6,
+                      fontSize: 12, color: C.danger, cursor: "pointer",
+                    }}
+                  >
+                    ×
+                  </button>
+                </div>
+              </div>
+            </div>
+          ))}
+
+          {/* テンプレート追加ボタン */}
+          <button
+            onClick={startNew}
+            style={{
+              width: "100%", padding: "10px 0", marginTop: 8,
+              background: "none", border: `1px dashed ${C.border}`, borderRadius: 8,
+              color: C.accent, fontSize: 14, fontWeight: 600, cursor: "pointer",
+            }}
+          >
+            + テンプレート追加
+          </button>
+
+          {/* テンプレート登録・編集フォーム（モーダル） */}
+          {showForm && (
+            <div style={{
+              position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)",
+              display: "flex", alignItems: "flex-end", justifyContent: "center", zIndex: 100,
+            }}
+              onClick={(e) => { if (e.target === e.currentTarget) setShowForm(false); }}
+            >
+              <div style={{
+                width: "100%", maxWidth: 480, maxHeight: "80vh",
+                background: C.bg, borderRadius: "16px 16px 0 0",
+                padding: "20px 16px", overflowY: "auto",
+              }}>
+                <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 16, color: C.text }}>
+                  {editingId ? "テンプレート編集" : "テンプレート登録"}
+                </div>
+
+                {/* テンプレート名 */}
+                <input
+                  type="text"
+                  value={tplName}
+                  onChange={(e) => setTplName(e.target.value)}
+                  placeholder="テンプレート名（例: 胸の日）"
+                  autoFocus
+                  style={{
+                    width: "100%", padding: "10px 12px", marginBottom: 12,
+                    border: `1px solid ${C.border}`, borderRadius: 8,
+                    fontSize: 14, color: C.text, boxSizing: "border-box",
+                  }}
+                />
+
+                {/* 種目選択 */}
+                <div style={{ fontSize: 13, color: C.sub, marginBottom: 8 }}>種目を選択（タップで追加/解除）:</div>
+                <div style={{ maxHeight: 300, overflowY: "auto", marginBottom: 16 }}>
+                  {db.activeExercises.map((ex) => {
+                    const isSelected = selectedIds.includes(ex.id);
+                    return (
+                      <button
+                        key={ex.id}
+                        onClick={() => toggleExercise(ex.id)}
+                        style={{
+                          display: "block", width: "100%", textAlign: "left",
+                          padding: "10px 12px", marginBottom: 4,
+                          background: isSelected ? "#EFF6FF" : C.cardBg,
+                          border: `1px solid ${isSelected ? C.accent : C.border}`,
+                          borderRadius: 8, fontSize: 14,
+                          color: isSelected ? C.accent : C.text,
+                          cursor: "pointer", fontWeight: isSelected ? 600 : 400,
+                        }}
+                      >
+                        {isSelected ? "✓ " : ""}{ex.name}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {selectedIds.length > 0 && (
+                  <div style={{ fontSize: 12, color: C.sub, marginBottom: 12 }}>
+                    選択中: {selectedIds.map((id) => {
+                      const ex = db.activeExercises.find((e) => e.id === id);
+                      return ex ? ex.name : "";
+                    }).filter(Boolean).join("、")}
+                  </div>
+                )}
+
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button
+                    onClick={() => setShowForm(false)}
+                    style={{
+                      flex: 1, padding: "12px 0",
+                      background: "none", border: `1px solid ${C.border}`, borderRadius: 8,
+                      fontSize: 14, color: C.sub, cursor: "pointer",
+                    }}
+                  >
+                    キャンセル
+                  </button>
+                  <button
+                    onClick={handleSave}
+                    disabled={!tplName.trim() || selectedIds.length === 0}
+                    style={{
+                      flex: 1, padding: "12px 0",
+                      background: (!tplName.trim() || selectedIds.length === 0) ? "#D1D5DB" : C.accent,
+                      color: "#fff", border: "none", borderRadius: 8,
+                      fontSize: 14, fontWeight: 600, cursor: "pointer",
+                    }}
+                  >
+                    {editingId ? "更新" : "登録"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* 削除確認ダイアログ */}
+          {confirmDeleteId && (
+            <div style={{
+              position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)",
+              display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100,
+            }}>
+              <div style={{
+                background: C.bg, borderRadius: 12, padding: 24, width: "90%", maxWidth: 340,
+              }}>
+                <div style={{ fontSize: 15, fontWeight: 700, color: C.text, marginBottom: 12 }}>
+                  テンプレートを削除しますか？
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button
+                    onClick={() => setConfirmDeleteId(null)}
+                    style={{
+                      flex: 1, padding: "12px 0",
+                      background: "none", border: `1px solid ${C.border}`, borderRadius: 8,
+                      fontSize: 14, color: C.sub, cursor: "pointer",
+                    }}
+                  >
+                    キャンセル
+                  </button>
+                  <button
+                    onClick={handleDelete}
+                    style={{
+                      flex: 1, padding: "12px 0",
+                      background: C.danger, color: "#fff", border: "none", borderRadius: 8,
+                      fontSize: 14, fontWeight: 600, cursor: "pointer",
+                    }}
+                  >
+                    削除する
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ============================================================
+    // コンポーネント: テンプレートから追加モーダル（TemplatePickerModal）
+    // ============================================================
+    function TemplatePickerModal({ db, onApply, onClose }) {
+      const getExerciseNames = (exerciseIds) => {
+        return exerciseIds
+          .map((id) => {
+            const ex = db.exercises.find((e) => e.id === id);
+            return ex && ex.isActive ? ex.name : null;
+          })
+          .filter(Boolean)
+          .join("、");
+      };
+
+      return (
+        <div style={{
+          position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)",
+          display: "flex", alignItems: "flex-end", justifyContent: "center", zIndex: 100,
+        }}
+          onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+        >
+          <div style={{
+            width: "100%", maxWidth: 480, maxHeight: "70vh",
+            background: C.bg, borderRadius: "16px 16px 0 0",
+            padding: "20px 16px", overflowY: "auto",
+          }}>
+            <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 16, color: C.text }}>テンプレートから追加</div>
+
+            {db.templates.map((tpl) => (
+              <button
+                key={tpl.id}
+                onClick={() => { onApply(tpl); onClose(); }}
+                style={{
+                  display: "block", width: "100%", textAlign: "left",
+                  padding: "12px", marginBottom: 6,
+                  background: C.cardBg, border: `1px solid ${C.border}`, borderRadius: 8,
+                  cursor: "pointer",
+                }}
+              >
+                <div style={{ fontSize: 15, fontWeight: 600, color: C.text }}>{tpl.name}</div>
+                <div style={{ fontSize: 12, color: C.sub, marginTop: 4 }}>
+                  {getExerciseNames(tpl.exerciseIds) || "(有効な種目なし)"}
+                </div>
+              </button>
+            ))}
+
+            <button
+              onClick={onClose}
+              style={{
+                width: "100%", padding: "14px 0", marginTop: 12,
+                background: "none", border: `1px solid ${C.border}`, borderRadius: 8,
+                fontSize: 15, color: C.sub, cursor: "pointer", fontWeight: 600,
+              }}
+            >
+              キャンセル
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+
+    // ============================================================
+    // 画面: 食事管理（NutritionScreen）— 新規追加
+    // ============================================================
+    function NutritionScreen({ db }) {
+      const [currentDate, setCurrentDate] = useState(todayStr());
+      const [showAddFood, setShowAddFood] = useState(null); // mealType or null
+      const [showMealTplPicker, setShowMealTplPicker] = useState(null); // mealType or null
+
+      const workout = db.getWorkoutByDate(currentDate);
+      const hasWorkout = !!workout && db.sets.some((s) => s.workoutId === workout?.id);
+
+      // トレーニング日判定: 1) 手動上書き優先 2) workout記録有無 3) デフォルトrest
+      const manualOverride = db.trainingDayOverrides[currentDate];
+      const isTrainingDay = manualOverride
+        ? manualOverride === "training"
+        : hasWorkout;
+
+      const goals = isTrainingDay
+        ? db.nutritionSettings.goals.trainingDay
+        : db.nutritionSettings.goals.restDay;
+
+      const mealsForDate = db.mealEntries.filter((e) => e.date === currentDate);
+      const intake = mealsForDate.reduce(
+        (acc, e) => ({ kcal: acc.kcal + (e.kcal || 0), protein: acc.protein + (e.protein || 0), fat: acc.fat + (e.fat || 0), carbs: acc.carbs + (e.carbs || 0) }),
+        { kcal: 0, protein: 0, fat: 0, carbs: 0 }
+      );
+
+      // 警告
+      const warnings = [];
+      if (intake.fat > goals.fat) warnings.push("脂質が目標を超過しています");
+      if (intake.kcal > goals.kcal) warnings.push("総カロリーが目標を超過しています");
+      if (intake.protein < goals.protein && mealsForDate.length > 0) warnings.push("たんぱく質が目標に不足しています");
+
+      // 週平均体重補正提案（直近7日 vs 前7日のカレンダー日ベース）
+      const getWeightProposal = () => {
+        const today = new Date(currentDate + "T00:00:00");
+        // 直近7日: currentDate から6日前まで
+        const recentStart = new Date(today);
+        recentStart.setDate(today.getDate() - 6);
+        const recentStartStr = recentStart.toISOString().slice(0, 10);
+        // 前7日: 7日前〜13日前
+        const prevEnd = new Date(recentStart);
+        prevEnd.setDate(recentStart.getDate() - 1);
+        const prevStart = new Date(prevEnd);
+        prevStart.setDate(prevEnd.getDate() - 6);
+        const prevStartStr = prevStart.toISOString().slice(0, 10);
+        const prevEndStr = prevEnd.toISOString().slice(0, 10);
+
+        const weightsWithDate = db.workouts.filter((w) => w.bodyWeight !== null);
+        const recent = weightsWithDate.filter((w) => w.date >= recentStartStr && w.date <= currentDate);
+        const prev = weightsWithDate.filter((w) => w.date >= prevStartStr && w.date <= prevEndStr);
+
+        if (recent.length < 2) return null; // 直近7日に2件未満なら表示しない
+        if (prev.length < 2) return null;
+
+        const avg = (arr) => arr.reduce((s, w) => s + w.bodyWeight, 0) / arr.length;
+        const recentAvg = avg(recent);
+        const prevAvg = avg(prev);
+        const diff = recentAvg - prevAvg;
+        const recentNote = `直近7日平均 (${recent.length}件)`;
+        const prevNote = `前7日平均 (${prev.length}件)`;
+        if (Math.abs(diff) < 0.1) return { type: "slow", msg: "体重変化が小さいため、摂取カロリーを少し下げることを検討してください", recentAvg: recentAvg.toFixed(1), prevAvg: prevAvg.toFixed(1), recentNote, prevNote };
+        if (diff < -0.5) return { type: "fast", msg: "体重の減少が大きいため、摂取カロリーを少し戻すことを検討してください", recentAvg: recentAvg.toFixed(1), prevAvg: prevAvg.toFixed(1), recentNote, prevNote };
+        return { type: "ok", msg: "現在のペースは適切です", recentAvg: recentAvg.toFixed(1), prevAvg: prevAvg.toFixed(1), recentNote, prevNote };
+      };
+      const proposal = getWeightProposal();
+
+      const toggleDayType = () => {
+        db.setTrainingDayOverride(currentDate, isTrainingDay ? "rest" : "training");
+      };
+
+      // PFCバー
+      const PFCBar = ({ label, current, goal, color }) => {
+        const pct = goal > 0 ? Math.min((current / goal) * 100, 100) : 0;
+        const over = current > goal;
+        return (
+          <div style={{ marginBottom: 8 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: C.text, marginBottom: 2 }}>
+              <span style={{ fontWeight: 600 }}>{label}</span>
+              <span style={{ color: over ? C.danger : C.sub }}>{Math.round(current)} / {goal}{label === "カロリー" ? " kcal" : " g"}</span>
+            </div>
+            <div style={{ height: 8, background: "#F3F4F6", borderRadius: 4, overflow: "hidden" }}>
+              <div style={{ width: `${pct}%`, height: "100%", background: over ? C.danger : color, borderRadius: 4, transition: "width 0.3s" }} />
+            </div>
+          </div>
+        );
+      };
+
+      return (
+        <div style={{ paddingBottom: 80 }}>
+          {/* 日付セレクター */}
+          <DateSelector date={currentDate} onChange={setCurrentDate} />
+
+          {/* 体重 & トレ日トグル */}
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+            <div style={{
+              flex: 1, padding: "8px 12px",
+              background: isTrainingDay ? "#DBEAFE" : C.cardBg,
+              border: `1px solid ${isTrainingDay ? "#93C5FD" : C.border}`,
+              borderRadius: 8, fontSize: 13,
+            }}>
+              <span style={{ fontWeight: 600 }}>{isTrainingDay ? "トレーニング日" : "休養日"}</span>
+              {workout && workout.bodyWeight && (
+                <span style={{ color: C.sub, marginLeft: 8 }}>体重: {workout.bodyWeight}kg</span>
+              )}
+            </div>
+            <button
+              onClick={toggleDayType}
+              style={{
+                padding: "8px 12px", background: "none",
+                border: `1px solid ${C.border}`, borderRadius: 8,
+                fontSize: 11, color: C.accent, cursor: "pointer", fontWeight: 600, whiteSpace: "nowrap",
+              }}
+            >切替</button>
+          </div>
+
+          {/* 日次サマリー */}
+          <div style={{
+            padding: "14px", marginBottom: 12,
+            background: C.cardBg, borderRadius: 10, border: `1px solid ${C.border}`,
+          }}>
+            <div style={{ fontSize: 14, fontWeight: 700, color: C.text, marginBottom: 10 }}>今日のサマリー</div>
+            <PFCBar label="カロリー" current={intake.kcal} goal={goals.kcal} color={C.accent} />
+            <PFCBar label="たんぱく質(P)" current={intake.protein} goal={goals.protein} color="#059669" />
+            <PFCBar label="脂質(F)" current={intake.fat} goal={goals.fat} color="#F59E0B" />
+            <PFCBar label="炭水化物(C)" current={intake.carbs} goal={goals.carbs} color="#8B5CF6" />
+          </div>
+
+          {/* 警告エリア */}
+          {warnings.length > 0 && (
+            <div style={{
+              padding: "10px 14px", marginBottom: 12,
+              background: C.warningBg, border: `1px solid ${C.warning}`,
+              borderRadius: 8, fontSize: 13, color: "#92400E", lineHeight: 1.6,
+            }}>
+              {warnings.map((w, i) => <div key={i}>{w}</div>)}
+            </div>
+          )}
+
+          {/* 週平均体重補正提案 */}
+          {proposal && (
+            <div style={{
+              padding: "10px 14px", marginBottom: 12,
+              background: proposal.type === "ok" ? "#ECFDF5" : "#FEF3C7",
+              border: `1px solid ${proposal.type === "ok" ? "#6EE7B7" : "#F59E0B"}`,
+              borderRadius: 8, fontSize: 12, color: C.text, lineHeight: 1.6,
+            }}>
+              <div style={{ fontWeight: 600, marginBottom: 4 }}>{proposal.recentNote}: {proposal.recentAvg}kg（{proposal.prevNote}: {proposal.prevAvg}kg）</div>
+              <div style={{ color: C.sub }}>{proposal.msg}</div>
+            </div>
+          )}
+
+          {/* 食事区分ブロック */}
+          {MEAL_TYPES.map(({ key, label }) => {
+            const entries = mealsForDate.filter((e) => e.mealType === key);
+            const blockTotal = entries.reduce(
+              (acc, e) => ({ kcal: acc.kcal + (e.kcal || 0), protein: acc.protein + (e.protein || 0), fat: acc.fat + (e.fat || 0), carbs: acc.carbs + (e.carbs || 0) }),
+              { kcal: 0, protein: 0, fat: 0, carbs: 0 }
+            );
+            return (
+              <div key={key} style={{
+                padding: "12px 14px", marginBottom: 10,
+                background: C.cardBg, borderRadius: 10, border: `1px solid ${C.border}`,
+              }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                  <span style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{label}</span>
+                  {entries.length > 0 && (
+                    <span style={{ fontSize: 11, color: C.sub }}>
+                      {Math.round(blockTotal.kcal)}kcal P{Math.round(blockTotal.protein)} F{Math.round(blockTotal.fat)} C{Math.round(blockTotal.carbs)}
+                    </span>
+                  )}
+                </div>
+
+                {entries.map((entry) => (
+                  <div key={entry.id} style={{
+                    display: "flex", alignItems: "center", justifyContent: "space-between",
+                    padding: "6px 0", borderBottom: `1px solid ${C.border}`,
+                    fontSize: 13,
+                  }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ color: C.text, fontWeight: 500 }}>{entry.nameSnapshot}</div>
+                      <div style={{ fontSize: 11, color: C.sub }}>
+                        {entry.amount}{entry.unit} / {entry.kcal}kcal P{entry.protein} F{entry.fat} C{entry.carbs}
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => db.deleteMealEntry(entry.id)}
+                      style={{
+                        background: "none", border: "none", color: C.danger,
+                        fontSize: 16, cursor: "pointer", padding: "4px 8px", flexShrink: 0,
+                      }}
+                    >×</button>
+                  </div>
+                ))}
+
+                <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+                  <button
+                    onClick={() => setShowAddFood(key)}
+                    style={{
+                      flex: 1, padding: "8px 0",
+                      background: "none", border: `1px dashed ${C.border}`, borderRadius: 6,
+                      color: C.accent, fontSize: 12, fontWeight: 600, cursor: "pointer",
+                    }}
+                  >+ 食材追加</button>
+                  {db.mealTemplates.length > 0 && (
+                    <button
+                      onClick={() => setShowMealTplPicker(key)}
+                      style={{
+                        padding: "8px 10px",
+                        background: "none", border: `1px dashed ${C.border}`, borderRadius: 6,
+                        color: C.accent, fontSize: 11, cursor: "pointer", whiteSpace: "nowrap",
+                      }}
+                    >テンプレ</button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+
+          {/* 食材追加モーダル */}
+          {showAddFood && (
+            <AddFoodModal
+              db={db}
+              date={currentDate}
+              mealType={showAddFood}
+              onClose={() => setShowAddFood(null)}
+            />
+          )}
+
+          {/* 食事テンプレ選択モーダル */}
+          {showMealTplPicker && (
+            <MealTplPickerModal
+              db={db}
+              date={currentDate}
+              mealType={showMealTplPicker}
+              onClose={() => setShowMealTplPicker(null)}
+            />
+          )}
+
+          {/* 食事履歴（直近の日別サマリー） */}
+          <NutritionHistory db={db} currentDate={currentDate} onDateSelect={setCurrentDate} />
+        </div>
+      );
+    }
+
+    // ============================================================
+    // 食事履歴コンポーネント（NutritionHistory）
+    // ============================================================
+    function NutritionHistory({ db, currentDate, onDateSelect }) {
+      const [expanded, setExpanded] = useState(false);
+
+      // 食事記録がある日付を集計（新しい順）
+      const dailySummaries = useMemo(() => {
+        const dateMap = {};
+        db.mealEntries.forEach((e) => {
+          if (!dateMap[e.date]) dateMap[e.date] = { kcal: 0, protein: 0, fat: 0, carbs: 0, count: 0 };
+          dateMap[e.date].kcal += e.kcal || 0;
+          dateMap[e.date].protein += e.protein || 0;
+          dateMap[e.date].fat += e.fat || 0;
+          dateMap[e.date].carbs += e.carbs || 0;
+          dateMap[e.date].count += 1;
+        });
+        return Object.entries(dateMap)
+          .map(([date, totals]) => ({ date, ...totals }))
+          .sort((a, b) => (a.date > b.date ? -1 : 1))
+          .slice(0, 30); // 最大30日分
+      }, [db.mealEntries]);
+
+      if (dailySummaries.length === 0) return null;
+
+      return (
+        <div style={{ marginTop: 16 }}>
+          <button onClick={() => setExpanded(!expanded)}
+            style={{ display: "flex", width: "100%", alignItems: "center", justifyContent: "space-between", padding: "10px 0", background: "none", border: "none", cursor: "pointer" }}
+          >
+            <span style={{ fontSize: 15, fontWeight: 700, color: C.text }}>食事履歴</span>
+            <span style={{ fontSize: 13, color: C.sub }}>{expanded ? "▼" : "▶"}</span>
+          </button>
+
+          {expanded && (
+            <div>
+              {dailySummaries.map((day) => (
+                <button key={day.date} onClick={() => onDateSelect(day.date)}
+                  style={{
+                    display: "block", width: "100%", textAlign: "left",
+                    padding: "10px 12px", marginBottom: 4,
+                    background: day.date === currentDate ? "#DBEAFE" : C.cardBg,
+                    border: `1px solid ${day.date === currentDate ? "#93C5FD" : C.border}`,
+                    borderRadius: 8, cursor: "pointer",
+                  }}
+                >
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <span style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{formatDateJP(day.date)}</span>
+                    <span style={{ fontSize: 13, fontWeight: 700, color: C.accent }}>{Math.round(day.kcal)} kcal</span>
+                  </div>
+                  <div style={{ fontSize: 11, color: C.sub, marginTop: 2 }}>
+                    P {Math.round(day.protein)}g / F {Math.round(day.fat)}g / C {Math.round(day.carbs)}g（{day.count}品）
+                  </div>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ============================================================
+    // 食材追加モーダル（AddFoodModal）
+    // ============================================================
+    function AddFoodModal({ db, date, mealType, onClose }) {
+      const [mode, setMode] = useState(db.foods.length > 0 ? "quick" : "manual");
+      const [selectedFood, setSelectedFood] = useState(null);
+      const [amount, setAmount] = useState("");
+      const [name, setName] = useState("");
+      const [unit, setUnit] = useState("g");
+      const [kcal, setKcal] = useState("");
+      const [protein, setProtein] = useState("");
+      const [fat, setFat] = useState("");
+      const [carbs, setCarbs] = useState("");
+      const [saveToMaster, setSaveToMaster] = useState(false);
+
+      const handleSelectFood = (food) => {
+        setSelectedFood(food);
+        setAmount(String(food.baseAmount));
+      };
+
+      const handleAddFromMaster = () => {
+        if (!selectedFood || !amount) return;
+        const ratio = parseFloat(amount) / selectedFood.baseAmount;
+        db.addMealEntry(date, mealType, selectedFood.id, null, selectedFood.name,
+          parseFloat(amount), selectedFood.baseUnit,
+          selectedFood.kcal * ratio, selectedFood.protein * ratio,
+          selectedFood.fat * ratio, selectedFood.carbs * ratio);
+        onClose();
+      };
+
+      const handleAddManual = () => {
+        if (!name.trim() || !kcal) return;
+        const amt = parseFloat(amount) || 100;
+        const k = parseFloat(kcal) || 0;
+        const p = parseFloat(protein) || 0;
+        const f = parseFloat(fat) || 0;
+        const c = parseFloat(carbs) || 0;
+        db.addMealEntry(date, mealType, null, null, name.trim(), amt, unit, k, p, f, c);
+        if (saveToMaster) {
+          db.addFood(name.trim(), amt, unit, k, p, f, c, true);
+        }
+        onClose();
+      };
+
+      const mealLabel = MEAL_TYPES.find((m) => m.key === mealType)?.label || mealType;
+
+      return (
+        <div style={{
+          position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)",
+          display: "flex", alignItems: "flex-end", justifyContent: "center", zIndex: 100,
+        }}
+          onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+        >
+          <div style={{
+            width: "100%", maxWidth: 480, maxHeight: "85vh",
+            background: C.bg, borderRadius: "16px 16px 0 0",
+            padding: "20px 16px", overflowY: "auto",
+          }}>
+            <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 4, color: C.text }}>食材を追加</div>
+            <div style={{ fontSize: 12, color: C.sub, marginBottom: 16 }}>{mealLabel}に追加</div>
+
+            {/* モード切替 */}
+            <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+              <button onClick={() => setMode("quick")}
+                style={{
+                  flex: 1, padding: "10px 0",
+                  background: mode === "quick" ? C.accent : C.cardBg,
+                  color: mode === "quick" ? "#fff" : C.text,
+                  border: `1px solid ${mode === "quick" ? C.accent : C.border}`,
+                  borderRadius: 6, fontSize: 13, fontWeight: 600, cursor: "pointer",
+                }}>よく使う食材</button>
+              <button onClick={() => setMode("manual")}
+                style={{
+                  flex: 1, padding: "10px 0",
+                  background: mode === "manual" ? C.accent : C.cardBg,
+                  color: mode === "manual" ? "#fff" : C.text,
+                  border: `1px solid ${mode === "manual" ? C.accent : C.border}`,
+                  borderRadius: 6, fontSize: 13, fontWeight: 600, cursor: "pointer",
+                }}>手入力</button>
+            </div>
+
+            {mode === "quick" && (
+              <>
+                {db.foods.length === 0 ? (
+                  <div style={{ fontSize: 13, color: C.sub, textAlign: "center", padding: "20px 0" }}>
+                    食材マスタが空です。設定画面で登録するか、手入力をご利用ください。
+                  </div>
+                ) : (
+                  <>
+                    <div style={{ maxHeight: 200, overflowY: "auto", marginBottom: 12 }}>
+                      {db.foods.filter((f) => f.isFavorite).map((food) => (
+                        <button key={food.id} onClick={() => handleSelectFood(food)}
+                          style={{
+                            display: "block", width: "100%", textAlign: "left",
+                            padding: "10px 12px", marginBottom: 4,
+                            background: selectedFood?.id === food.id ? "#DBEAFE" : C.cardBg,
+                            border: `1px solid ${selectedFood?.id === food.id ? "#93C5FD" : C.border}`,
+                            borderRadius: 8, fontSize: 13, color: C.text, cursor: "pointer",
+                          }}
+                        >
+                          <div style={{ fontWeight: 600 }}>{food.name}</div>
+                          <div style={{ fontSize: 11, color: C.sub }}>
+                            {food.baseAmount}{food.baseUnit}あたり: {food.kcal}kcal P{food.protein} F{food.fat} C{food.carbs}
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                    {selectedFood && (
+                      <div style={{ marginBottom: 12 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                          <span style={{ fontSize: 13, color: C.sub }}>量:</span>
+                          <input type="number" inputMode="decimal" value={amount} onChange={(e) => setAmount(e.target.value)}
+                            style={{ flex: 1, padding: "10px 12px", border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 14, textAlign: "center" }}
+                          />
+                          <span style={{ fontSize: 13, color: C.sub }}>{selectedFood.baseUnit}</span>
+                        </div>
+                        {amount && (
+                          <div style={{ fontSize: 12, color: C.sub, marginBottom: 8 }}>
+                            {(() => {
+                              const r = parseFloat(amount) / selectedFood.baseAmount;
+                              return `${Math.round(selectedFood.kcal * r)}kcal P${Math.round(selectedFood.protein * r * 10) / 10} F${Math.round(selectedFood.fat * r * 10) / 10} C${Math.round(selectedFood.carbs * r * 10) / 10}`;
+                            })()}
+                          </div>
+                        )}
+                        <button onClick={handleAddFromMaster}
+                          style={{ width: "100%", padding: "12px 0", background: C.accent, color: "#fff", border: "none", borderRadius: 8, fontSize: 14, fontWeight: 600, cursor: "pointer" }}
+                        >追加</button>
+                      </div>
+                    )}
+                  </>
+                )}
+              </>
+            )}
+
+            {mode === "manual" && (
+              <div>
+                <input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="食材名（例: プロテイン）"
+                  style={{ width: "100%", padding: "10px 12px", marginBottom: 8, border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 14, color: C.text, boxSizing: "border-box" }}
+                />
+                <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                  <input type="number" inputMode="decimal" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="量"
+                    style={{ flex: 1, padding: "10px 12px", border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 14, textAlign: "center" }}
+                  />
+                  <select value={unit} onChange={(e) => setUnit(e.target.value)}
+                    style={{ padding: "10px 8px", border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 14, background: C.bg }}
+                  >
+                    <option value="g">g</option>
+                    <option value="ml">ml</option>
+                    <option value="個">個</option>
+                    <option value="食分">食分</option>
+                  </select>
+                </div>
+                <input type="number" inputMode="decimal" value={kcal} onChange={(e) => setKcal(e.target.value)} placeholder="カロリー (kcal)"
+                  style={{ width: "100%", padding: "10px 12px", marginBottom: 8, border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 14, color: C.text, boxSizing: "border-box" }}
+                />
+                <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                  <input type="number" inputMode="decimal" value={protein} onChange={(e) => setProtein(e.target.value)} placeholder="P (g)"
+                    style={{ flex: 1, padding: "10px 12px", border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 14, textAlign: "center" }}
+                  />
+                  <input type="number" inputMode="decimal" value={fat} onChange={(e) => setFat(e.target.value)} placeholder="F (g)"
+                    style={{ flex: 1, padding: "10px 12px", border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 14, textAlign: "center" }}
+                  />
+                  <input type="number" inputMode="decimal" value={carbs} onChange={(e) => setCarbs(e.target.value)} placeholder="C (g)"
+                    style={{ flex: 1, padding: "10px 12px", border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 14, textAlign: "center" }}
+                  />
+                </div>
+                <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, color: C.sub, marginBottom: 12, cursor: "pointer" }}>
+                  <input type="checkbox" checked={saveToMaster} onChange={(e) => setSaveToMaster(e.target.checked)} />
+                  よく使う食材に保存
+                </label>
+                <button onClick={handleAddManual}
+                  disabled={!name.trim() || !kcal}
+                  style={{
+                    width: "100%", padding: "12px 0",
+                    background: (name.trim() && kcal) ? C.accent : "#D1D5DB",
+                    color: "#fff", border: "none", borderRadius: 8,
+                    fontSize: 14, fontWeight: 600, cursor: "pointer",
+                  }}
+                >追加</button>
+              </div>
+            )}
+
+            <button onClick={onClose}
+              style={{ width: "100%", padding: "12px 0", marginTop: 12, background: "none", border: `1px solid ${C.border}`, borderRadius: 8, fontSize: 14, color: C.sub, cursor: "pointer", fontWeight: 600 }}
+            >キャンセル</button>
+          </div>
+        </div>
+      );
+    }
+
+    // ============================================================
+    // 食事テンプレ選択モーダル（MealTplPickerModal）
+    // ============================================================
+    function MealTplPickerModal({ db, date, mealType, onClose }) {
+      const handleApply = (tpl) => {
+        tpl.items.forEach((item) => {
+          const food = db.foods.find((f) => f.id === item.foodId);
+          if (!food) return;
+          const ratio = (item.amount || food.baseAmount) / food.baseAmount;
+          db.addMealEntry(date, mealType, food.id, tpl.id, food.name,
+            item.amount || food.baseAmount, item.unit || food.baseUnit,
+            food.kcal * ratio, food.protein * ratio, food.fat * ratio, food.carbs * ratio);
+        });
+        onClose();
+      };
+
+      return (
+        <div style={{
+          position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)",
+          display: "flex", alignItems: "flex-end", justifyContent: "center", zIndex: 100,
+        }}
+          onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+        >
+          <div style={{
+            width: "100%", maxWidth: 480, maxHeight: "70vh",
+            background: C.bg, borderRadius: "16px 16px 0 0",
+            padding: "20px 16px", overflowY: "auto",
+          }}>
+            <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 16, color: C.text }}>食事テンプレートから追加</div>
+
+            {db.mealTemplates.map((tpl) => {
+              const totalKcal = tpl.items.reduce((sum, item) => {
+                const food = db.foods.find((f) => f.id === item.foodId);
+                if (!food) return sum;
+                const ratio = (item.amount || food.baseAmount) / food.baseAmount;
+                return sum + food.kcal * ratio;
+              }, 0);
+              return (
+                <button key={tpl.id} onClick={() => handleApply(tpl)}
+                  style={{
+                    display: "block", width: "100%", textAlign: "left",
+                    padding: "12px", marginBottom: 6,
+                    background: C.cardBg, border: `1px solid ${C.border}`, borderRadius: 8, cursor: "pointer",
+                  }}
+                >
+                  <div style={{ fontSize: 15, fontWeight: 600, color: C.text }}>{tpl.name}</div>
+                  <div style={{ fontSize: 12, color: C.sub, marginTop: 4 }}>
+                    {tpl.items.length}品 / 約{Math.round(totalKcal)}kcal
+                  </div>
+                </button>
+              );
+            })}
+
+            <button onClick={onClose}
+              style={{ width: "100%", padding: "14px 0", marginTop: 12, background: "none", border: `1px solid ${C.border}`, borderRadius: 8, fontSize: 15, color: C.sub, cursor: "pointer", fontWeight: 600 }}
+            >キャンセル</button>
+          </div>
+        </div>
+      );
+    }
+
+    // ============================================================
+    // 設定: 栄養目標設定セクション
+    // ============================================================
+    function NutritionGoalSettingsSection({ db }) {
+      const [expanded, setExpanded] = useState(false);
+      const profile = db.nutritionSettings.profile;
+      const goals = db.nutritionSettings.goals;
+
+      const handleProfileChange = (key, value) => {
+        const newProfile = { ...profile, [key]: value };
+        db.updateNutritionSettings({ profile: newProfile });
+      };
+
+      const handleAutoCalc = () => {
+        const latestW = db.workouts
+          .filter((w) => w.bodyWeight !== null)
+          .sort((a, b) => (a.date > b.date ? -1 : 1))[0];
+        const bodyWeight = latestW ? latestW.bodyWeight : 70;
+        const newGoals = calcNutritionGoals(profile, bodyWeight);
+        db.updateNutritionGoals(newGoals);
+      };
+
+      const handleGoalChange = (dayType, key, value) => {
+        const v = parseInt(value, 10);
+        if (isNaN(v) || v < 0) return;
+        const newGoals = {
+          ...goals,
+          [dayType]: { ...goals[dayType], [key]: v },
+          isManualOverride: true,
+        };
+        db.updateNutritionGoals(newGoals);
+      };
+
+      const GoalRow = ({ dayLabel, dayKey }) => (
+        <div style={{ marginBottom: 12 }}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: C.text, marginBottom: 6 }}>{dayLabel}</div>
+          <div style={{ display: "flex", gap: 6 }}>
+            {[{ k: "kcal", l: "kcal" }, { k: "protein", l: "P(g)" }, { k: "fat", l: "F(g)" }, { k: "carbs", l: "C(g)" }].map(({ k, l }) => (
+              <div key={k} style={{ flex: 1 }}>
+                <div style={{ fontSize: 10, color: C.sub, marginBottom: 2 }}>{l}</div>
+                <input type="number" inputMode="numeric" value={goals[dayKey][k]}
+                  onChange={(e) => handleGoalChange(dayKey, k, e.target.value)}
+                  style={{ width: "100%", padding: "8px 4px", border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 13, textAlign: "center", boxSizing: "border-box" }}
+                />
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+
+      return (
+        <div style={{ marginBottom: 24 }}>
+          <button onClick={() => setExpanded(!expanded)}
+            style={{ display: "flex", width: "100%", alignItems: "center", justifyContent: "space-between", padding: 0, background: "none", border: "none", cursor: "pointer" }}
+          >
+            <span style={{ fontSize: 16, fontWeight: 700, color: C.text }}>食事目標設定</span>
+            <span style={{ fontSize: 13, color: C.sub }}>{expanded ? "▼" : "▶"}</span>
+          </button>
+
+          {expanded && (
+            <div style={{ marginTop: 12 }}>
+              {/* プロフィール */}
+              <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 11, color: C.sub, marginBottom: 2 }}>性別</div>
+                  <select value={profile.sex} onChange={(e) => handleProfileChange("sex", e.target.value)}
+                    style={{ width: "100%", padding: "8px", border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 13, background: C.bg }}
+                  ><option value="male">男性</option><option value="female">女性</option></select>
+                </div>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 11, color: C.sub, marginBottom: 2 }}>年齢</div>
+                  <input type="number" value={profile.age} onChange={(e) => handleProfileChange("age", parseInt(e.target.value) || 0)}
+                    style={{ width: "100%", padding: "8px", border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 13, textAlign: "center", boxSizing: "border-box" }}
+                  />
+                </div>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 11, color: C.sub, marginBottom: 2 }}>身長cm</div>
+                  <input type="number" value={profile.heightCm} onChange={(e) => handleProfileChange("heightCm", parseInt(e.target.value) || 0)}
+                    style={{ width: "100%", padding: "8px", border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 13, textAlign: "center", boxSizing: "border-box" }}
+                  />
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 11, color: C.sub, marginBottom: 2 }}>活動量</div>
+                  <select value={profile.activityLevel} onChange={(e) => handleProfileChange("activityLevel", e.target.value)}
+                    style={{ width: "100%", padding: "8px", border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 13, background: C.bg }}
+                  >{Object.entries(ACTIVITY_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}</select>
+                </div>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 11, color: C.sub, marginBottom: 2 }}>目標</div>
+                  <select value={profile.goalType} onChange={(e) => handleProfileChange("goalType", e.target.value)}
+                    style={{ width: "100%", padding: "8px", border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 13, background: C.bg }}
+                  ><option value="cut">減量</option><option value="maintain">維持</option><option value="bulk">増量</option></select>
+                </div>
+              </div>
+
+              <button onClick={handleAutoCalc}
+                style={{ width: "100%", padding: "10px 0", marginBottom: 16, background: C.accent, color: "#fff", border: "none", borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: "pointer" }}
+              >自動計算する</button>
+
+              {/* 目標値（手動編集可能） */}
+              <GoalRow dayLabel="トレーニング日" dayKey="trainingDay" />
+              <GoalRow dayLabel="休養日" dayKey="restDay" />
+
+              {goals.isManualOverride && (
+                <div style={{ fontSize: 11, color: C.sub, marginTop: 4 }}>※手動で変更済み（自動計算で上書きできます）</div>
+              )}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ============================================================
+    // 設定: 食材マスタ管理セクション
+    // ============================================================
+    function FoodMasterSection({ db }) {
+      const [expanded, setExpanded] = useState(false);
+      const [showForm, setShowForm] = useState(false);
+      const [editId, setEditId] = useState(null);
+      const [name, setName] = useState("");
+      const [baseAmount, setBaseAmount] = useState("100");
+      const [baseUnit, setBaseUnit] = useState("g");
+      const [kcal, setKcal] = useState("");
+      const [protein, setProtein] = useState("");
+      const [fat, setFat] = useState("");
+      const [carbs, setCarbs] = useState("");
+
+      const resetForm = () => {
+        setEditId(null); setName(""); setBaseAmount("100"); setBaseUnit("g");
+        setKcal(""); setProtein(""); setFat(""); setCarbs("");
+        setShowForm(false);
+      };
+
+      const startEdit = (food) => {
+        setEditId(food.id); setName(food.name);
+        setBaseAmount(String(food.baseAmount)); setBaseUnit(food.baseUnit);
+        setKcal(String(food.kcal)); setProtein(String(food.protein));
+        setFat(String(food.fat)); setCarbs(String(food.carbs));
+        setShowForm(true);
+      };
+
+      const handleSave = () => {
+        if (!name.trim() || !kcal) return;
+        const data = {
+          name: name.trim(), baseAmount: parseFloat(baseAmount) || 100, baseUnit,
+          kcal: parseFloat(kcal) || 0, protein: parseFloat(protein) || 0,
+          fat: parseFloat(fat) || 0, carbs: parseFloat(carbs) || 0,
+        };
+        if (editId) {
+          db.updateFood(editId, data);
+        } else {
+          db.addFood(data.name, data.baseAmount, data.baseUnit, data.kcal, data.protein, data.fat, data.carbs, true);
+        }
+        resetForm();
+      };
+
+      return (
+        <div style={{ marginBottom: 24 }}>
+          <button onClick={() => setExpanded(!expanded)}
+            style={{ display: "flex", width: "100%", alignItems: "center", justifyContent: "space-between", padding: 0, background: "none", border: "none", cursor: "pointer" }}
+          >
+            <span style={{ fontSize: 16, fontWeight: 700, color: C.text }}>食材マスタ管理</span>
+            <span style={{ fontSize: 13, color: C.sub }}>{expanded ? "▼" : "▶"}</span>
+          </button>
+
+          {expanded && (
+            <div style={{ marginTop: 12 }}>
+              {db.foods.length === 0 && (
+                <div style={{ fontSize: 13, color: C.sub, marginBottom: 12 }}>食材が登録されていません。</div>
+              )}
+
+              {db.foods.map((food) => (
+                <div key={food.id} style={{
+                  padding: "10px 12px", marginBottom: 4,
+                  background: C.cardBg, borderRadius: 8, border: `1px solid ${C.border}`,
+                  display: "flex", justifyContent: "space-between", alignItems: "center",
+                }}>
+                  <div>
+                    <div style={{ fontSize: 14, fontWeight: 600, color: C.text }}>{food.name}</div>
+                    <div style={{ fontSize: 11, color: C.sub }}>
+                      {food.baseAmount}{food.baseUnit}あたり: {food.kcal}kcal P{food.protein} F{food.fat} C{food.carbs}
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                    <button onClick={() => startEdit(food)}
+                      style={{ padding: "4px 10px", background: "none", border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 12, color: C.sub, cursor: "pointer" }}
+                    >編集</button>
+                    <button onClick={() => db.deleteFood(food.id)}
+                      style={{ padding: "4px 10px", background: "none", border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 12, color: C.danger, cursor: "pointer" }}
+                    >×</button>
+                  </div>
+                </div>
+              ))}
+
+              {!showForm ? (
+                <button onClick={() => { resetForm(); setShowForm(true); }}
+                  style={{ width: "100%", padding: "10px 0", marginTop: 8, background: "none", border: `1px dashed ${C.border}`, borderRadius: 8, color: C.accent, fontSize: 14, fontWeight: 600, cursor: "pointer" }}
+                >+ 食材追加</button>
+              ) : (
+                <div style={{ marginTop: 8, padding: 12, background: C.cardBg, borderRadius: 8, border: `1px solid ${C.border}` }}>
+                  <input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="食材名"
+                    style={{ width: "100%", padding: "8px 10px", marginBottom: 8, border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 13, boxSizing: "border-box" }}
+                  />
+                  <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+                    <input type="number" value={baseAmount} onChange={(e) => setBaseAmount(e.target.value)} placeholder="量"
+                      style={{ flex: 1, padding: "8px", border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 13, textAlign: "center" }}
+                    />
+                    <select value={baseUnit} onChange={(e) => setBaseUnit(e.target.value)}
+                      style={{ padding: "8px", border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 13, background: C.bg }}
+                    ><option value="g">g</option><option value="ml">ml</option><option value="個">個</option><option value="食分">食分</option></select>
+                  </div>
+                  <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+                    <input type="number" value={kcal} onChange={(e) => setKcal(e.target.value)} placeholder="kcal"
+                      style={{ flex: 1, padding: "8px", border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 13, textAlign: "center" }} />
+                    <input type="number" value={protein} onChange={(e) => setProtein(e.target.value)} placeholder="P(g)"
+                      style={{ flex: 1, padding: "8px", border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 13, textAlign: "center" }} />
+                    <input type="number" value={fat} onChange={(e) => setFat(e.target.value)} placeholder="F(g)"
+                      style={{ flex: 1, padding: "8px", border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 13, textAlign: "center" }} />
+                    <input type="number" value={carbs} onChange={(e) => setCarbs(e.target.value)} placeholder="C(g)"
+                      style={{ flex: 1, padding: "8px", border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 13, textAlign: "center" }} />
+                  </div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button onClick={resetForm}
+                      style={{ flex: 1, padding: "10px 0", background: "none", border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 13, color: C.sub, cursor: "pointer" }}
+                    >取消</button>
+                    <button onClick={handleSave}
+                      disabled={!name.trim() || !kcal}
+                      style={{ flex: 1, padding: "10px 0", background: (name.trim() && kcal) ? C.accent : "#D1D5DB", color: "#fff", border: "none", borderRadius: 6, fontSize: 13, fontWeight: 600, cursor: "pointer" }}
+                    >{editId ? "更新" : "登録"}</button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ============================================================
+    // 設定: 食事テンプレ管理セクション
+    // ============================================================
+    function MealTemplateMasterSection({ db }) {
+      const [expanded, setExpanded] = useState(false);
+      const [showForm, setShowForm] = useState(false);
+      const [tplName, setTplName] = useState("");
+      const [selectedFoodIds, setSelectedFoodIds] = useState([]);
+
+      const toggleFood = (id) => {
+        setSelectedFoodIds((prev) => prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]);
+      };
+
+      const handleSave = () => {
+        if (!tplName.trim() || selectedFoodIds.length === 0) return;
+        const items = selectedFoodIds.map((fid) => {
+          const food = db.foods.find((f) => f.id === fid);
+          return { foodId: fid, amount: food ? food.baseAmount : 100, unit: food ? food.baseUnit : "g" };
+        });
+        db.addMealTemplate(tplName.trim(), items);
+        setTplName(""); setSelectedFoodIds([]); setShowForm(false);
+      };
+
+      return (
+        <div style={{ marginBottom: 24 }}>
+          <button onClick={() => setExpanded(!expanded)}
+            style={{ display: "flex", width: "100%", alignItems: "center", justifyContent: "space-between", padding: 0, background: "none", border: "none", cursor: "pointer" }}
+          >
+            <span style={{ fontSize: 16, fontWeight: 700, color: C.text }}>食事テンプレ管理</span>
+            <span style={{ fontSize: 13, color: C.sub }}>{expanded ? "▼" : "▶"}</span>
+          </button>
+
+          {expanded && (
+            <div style={{ marginTop: 12 }}>
+              {db.mealTemplates.length === 0 && !showForm && (
+                <div style={{ fontSize: 13, color: C.sub, marginBottom: 12 }}>
+                  食事テンプレを登録すると、よく食べる組み合わせをワンタップで追加できます。
+                </div>
+              )}
+
+              {db.mealTemplates.map((tpl) => (
+                <div key={tpl.id} style={{
+                  padding: "10px 12px", marginBottom: 4,
+                  background: C.cardBg, borderRadius: 8, border: `1px solid ${C.border}`,
+                  display: "flex", justifyContent: "space-between", alignItems: "center",
+                }}>
+                  <div>
+                    <div style={{ fontSize: 14, fontWeight: 600, color: C.text }}>{tpl.name}</div>
+                    <div style={{ fontSize: 11, color: C.sub }}>
+                      {tpl.items.map((item) => {
+                        const food = db.foods.find((f) => f.id === item.foodId);
+                        return food ? food.name : "(削除済み)";
+                      }).join("、")}
+                    </div>
+                  </div>
+                  <button onClick={() => db.deleteMealTemplate(tpl.id)}
+                    style={{ padding: "4px 10px", background: "none", border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 12, color: C.danger, cursor: "pointer", flexShrink: 0 }}
+                  >×</button>
+                </div>
+              ))}
+
+              {!showForm ? (
+                <button onClick={() => setShowForm(true)}
+                  disabled={db.foods.length === 0}
+                  style={{
+                    width: "100%", padding: "10px 0", marginTop: 8,
+                    background: "none", border: `1px dashed ${C.border}`, borderRadius: 8,
+                    color: db.foods.length > 0 ? C.accent : C.sub,
+                    fontSize: 14, fontWeight: 600, cursor: "pointer",
+                  }}
+                >{db.foods.length > 0 ? "+ テンプレ追加" : "食材を先に登録してください"}</button>
+              ) : (
+                <div style={{ marginTop: 8, padding: 12, background: C.cardBg, borderRadius: 8, border: `1px solid ${C.border}` }}>
+                  <input type="text" value={tplName} onChange={(e) => setTplName(e.target.value)} placeholder="テンプレ名（例: いつもの朝食）"
+                    style={{ width: "100%", padding: "8px 10px", marginBottom: 8, border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 13, boxSizing: "border-box" }}
+                  />
+                  <div style={{ fontSize: 12, color: C.sub, marginBottom: 6 }}>食材を選択:</div>
+                  <div style={{ maxHeight: 200, overflowY: "auto", marginBottom: 12 }}>
+                    {db.foods.map((food) => (
+                      <button key={food.id} onClick={() => toggleFood(food.id)}
+                        style={{
+                          display: "block", width: "100%", textAlign: "left",
+                          padding: "8px 10px", marginBottom: 3,
+                          background: selectedFoodIds.includes(food.id) ? "#EFF6FF" : C.bg,
+                          border: `1px solid ${selectedFoodIds.includes(food.id) ? C.accent : C.border}`,
+                          borderRadius: 6, fontSize: 13, color: C.text, cursor: "pointer",
+                        }}
+                      >{selectedFoodIds.includes(food.id) ? "✓ " : ""}{food.name}</button>
+                    ))}
+                  </div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button onClick={() => { setShowForm(false); setTplName(""); setSelectedFoodIds([]); }}
+                      style={{ flex: 1, padding: "10px 0", background: "none", border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 13, color: C.sub, cursor: "pointer" }}
+                    >取消</button>
+                    <button onClick={handleSave}
+                      disabled={!tplName.trim() || selectedFoodIds.length === 0}
+                      style={{ flex: 1, padding: "10px 0", background: (tplName.trim() && selectedFoodIds.length > 0) ? C.accent : "#D1D5DB", color: "#fff", border: "none", borderRadius: 6, fontSize: 13, fontWeight: 600, cursor: "pointer" }}
+                    >登録</button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ============================================================
+    // 画面: 設定（SettingsScreen）— 設計書 2-4
+    // ============================================================
+    function SettingsScreen({ db }) {
+      return (
+        <div style={{ paddingBottom: 80 }}>
+          <div style={{ fontSize: 18, fontWeight: 700, color: C.text, marginBottom: 16 }}>設定</div>
+
+          {/* 種目管理 */}
+          <ExerciseManager db={db} />
+
+          {/* テンプレート管理 */}
+          <TemplateManager db={db} />
+
+          {/* --- 食事目標設定 --- */}
+          <NutritionGoalSettingsSection db={db} />
+
+          {/* --- 食材マスタ管理 --- */}
+          <FoodMasterSection db={db} />
+
+          {/* --- 食事テンプレ管理 --- */}
+          <MealTemplateMasterSection db={db} />
+
+          {/* データ管理 */}
+          <div style={{ fontSize: 16, fontWeight: 700, color: C.text, marginBottom: 12 }}>データ管理</div>
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            <JsonBackupButton db={db} />
+            <JsonRestoreButton db={db} />
+            <CsvExportButton db={db} />
+            <CsvImportButton db={db} />
+            <DataResetButton db={db} />
+          </div>
+
+          {/* データ件数サマリー */}
+          <div style={{
+            marginTop: 20, padding: "12px 14px",
+            background: C.cardBg, borderRadius: 8, border: `1px solid ${C.border}`,
+            fontSize: 13, color: C.sub, lineHeight: 1.8,
+          }}>
+            <div>トレーニング日数: {db.workouts.length}日</div>
+            <div>登録種目数: {db.activeExercises.length}種目</div>
+            <div>総セット数: {db.sets.filter((s) => s.weight > 0 || s.reps > 0).length}セット</div>
+            <div>食材マスタ: {db.foods.length}件</div>
+            <div>食事記録: {db.mealEntries.length}件</div>
+          </div>
+        </div>
+      );
+    }
+
+    // ============================================================
+    // タブナビゲーション（設計書 2-1: 下部固定タブ3つ）
+    // ============================================================
+    const TAB_ITEMS = [
+      { key: "record", label: "記録", icon: "M12 20h9M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4L16.5 3.5z" },
+      { key: "nutrition", label: "食事", icon: "M18 8h1a4 4 0 010 8h-1M2 8h16v9a4 4 0 01-4 4H6a4 4 0 01-4-4V8zM6 1v3M10 1v3M14 1v3" },
+      { key: "history", label: "履歴", icon: "M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" },
+      { key: "settings", label: "設定", icon: "M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z M15 12a3 3 0 11-6 0 3 3 0 016 0z" },
+    ];
+
+    function TabIcon({ d, active }) {
+      return (
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none"
+          stroke={active ? C.accent : C.sub} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d={d} />
+        </svg>
+      );
+    }
+
+    // ============================================================
+    // App（メインコンポーネント）
+    // ============================================================
+    function App() {
+      const db = useMyLiftLogDB();
+      const [tab, setTab] = useState("record");
+
+      return (
+        <div style={{
+          fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+          maxWidth: 480, margin: "0 auto", background: C.bg,
+          minHeight: "100vh", position: "relative", color: C.text,
+        }}>
+          <BackupBanner />
+
+          {/* コンテンツエリア */}
+          <div style={{ padding: "16px 16px 0" }}>
+            {tab === "record" && <RecordScreen db={db} />}
+            {tab === "nutrition" && <NutritionScreen db={db} />}
+            {tab === "history" && <HistoryScreen db={db} />}
+            {tab === "settings" && <SettingsScreen db={db} />}
+          </div>
+
+          {/* 下部タブナビゲーション（設計書 7-3: 高さ56px） */}
+          <div style={{
+            position: "fixed", bottom: 0, left: "50%", transform: "translateX(-50%)",
+            width: "100%", maxWidth: 480, height: 56,
+            display: "flex", background: C.bg,
+            borderTop: `1px solid ${C.border}`,
+            zIndex: 50,
+          }}>
+            {TAB_ITEMS.map((t) => (
+              <button
+                key={t.key}
+                onClick={() => setTab(t.key)}
+                style={{
+                  flex: 1, display: "flex", flexDirection: "column",
+                  alignItems: "center", justifyContent: "center", gap: 2,
+                  background: "none", border: "none",
+                  color: tab === t.key ? C.accent : C.sub,
+                  fontSize: 11, fontWeight: tab === t.key ? 700 : 400,
+                  cursor: "pointer",
+                }}
+              >
+                <TabIcon d={t.icon} active={tab === t.key} />
+                {t.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+  <script>if ("serviceWorker" in navigator) { navigator.serviceWorker.register("service-worker.js"); }</script>
+</body>
+</html>
